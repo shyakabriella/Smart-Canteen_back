@@ -1,16 +1,32 @@
 <?php
 
+$defaultOrigins = implode(',', [
+    // Local development
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:3010',
+    'http://127.0.0.1:3010',
+
+    // Production frontend
+    'https://canabera.asyncafrica.com',
+    'https://www.canabera.asyncafrica.com',
+
+    // API domain
+    'https://canteen.asyncafrica.com',
+    'https://www.canteen.asyncafrica.com',
+]);
+
 $allowedOrigins = array_values(
-    array_filter(
-        array_map(
-            'trim',
-            explode(
-                ',',
-                env(
-                    'CORS_ALLOWED_ORIGINS',
-                    'http://localhost:3000,http://127.0.0.1:3000,http://192.168.1.151:3000,https://www.canteen.asyncafrica.com'
+    array_unique(
+        array_filter(
+            array_map(
+                static fn (string $origin): string => rtrim(trim($origin), '/'),
+                explode(
+                    ',',
+                    (string) env('CORS_ALLOWED_ORIGINS', $defaultOrigins)
                 )
-            )
+            ),
+            static fn (string $origin): bool => $origin !== ''
         )
     )
 );
@@ -19,11 +35,8 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Paths
+    | CORS Paths
     |--------------------------------------------------------------------------
-    |
-    | Laravel applies CORS handling to these routes.
-    |
     */
 
     'paths' => [
@@ -33,7 +46,7 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Allowed HTTP Methods
+    | Allowed Methods
     |--------------------------------------------------------------------------
     */
 
@@ -45,9 +58,6 @@ return [
     |--------------------------------------------------------------------------
     | Allowed Origins
     |--------------------------------------------------------------------------
-    |
-    | Do not use "*" while sending credentialed requests.
-    |
     */
 
     'allowed_origins' => $allowedOrigins,
@@ -64,13 +74,15 @@ return [
     |--------------------------------------------------------------------------
     | Allowed Headers
     |--------------------------------------------------------------------------
-    |
-    | This permits Authorization, Content-Type and Accept headers.
-    |
     */
 
     'allowed_headers' => [
-        '*',
+        'Accept',
+        'Authorization',
+        'Content-Type',
+        'Origin',
+        'X-Requested-With',
+        'X-XSRF-TOKEN',
     ],
 
     /*
@@ -83,21 +95,20 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Preflight Cache
+    | Preflight Cache Time
     |--------------------------------------------------------------------------
     */
 
-    'max_age' => 0,
+    'max_age' => 86400,
 
     /*
     |--------------------------------------------------------------------------
     | Credentials
     |--------------------------------------------------------------------------
     |
-    | This project uses Bearer tokens rather than session cookies.
+    | Keep false because authentication uses Bearer tokens.
     |
     */
 
     'supports_credentials' => false,
-
 ];
