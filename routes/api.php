@@ -4,6 +4,7 @@ use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\API\RegisterController;
 use App\Http\Controllers\API\FoodCategoryController;
 use App\Http\Controllers\API\FoodItemController;
+use App\Http\Controllers\API\CanteenTableController;
 use App\Http\Controllers\API\InventoryStockController;
 use App\Http\Controllers\API\StockMovementController;
 use App\Http\Controllers\API\WalletTopUpController;
@@ -45,6 +46,21 @@ Route::get(
 
 /*
 |--------------------------------------------------------------------------
+| Public Canteen Table QR Route
+|--------------------------------------------------------------------------
+|
+| This endpoint is opened when a customer scans a table QR code.
+| Authentication is not required.
+|
+*/
+
+Route::get(
+    'canteen-tables/public/{qrToken}',
+    [CanteenTableController::class, 'publicShow']
+)->whereUuid('qrToken');
+
+/*
+|--------------------------------------------------------------------------
 | Protected API Routes
 |--------------------------------------------------------------------------
 */
@@ -68,8 +84,8 @@ Route::middleware('auth:sanctum')->group(function () {
     );
 
     /*
-     * Used by wallet transactions and other admin forms
-     * to select a user instead of typing the user ID.
+     * Used by wallet transactions and other administrative forms
+     * to select users instead of entering user IDs manually.
      */
     Route::get(
         'users',
@@ -112,6 +128,36 @@ Route::middleware('auth:sanctum')->group(function () {
         'food-items/{foodItem}/availability',
         [FoodItemController::class, 'updateAvailability']
     )->whereNumber('foodItem');
+
+    /*
+    |--------------------------------------------------------------------------
+    | Canteen Table Routes
+    |--------------------------------------------------------------------------
+    |
+    | Every canteen table has a unique QR token.
+    | The public QR endpoint is declared outside the auth middleware.
+    |
+    */
+
+    Route::get(
+        'canteen-tables/summary',
+        [CanteenTableController::class, 'summary']
+    );
+
+    Route::post(
+        'canteen-tables/{canteenTable}/regenerate-qr',
+        [CanteenTableController::class, 'regenerateQr']
+    )->whereNumber('canteenTable');
+
+    Route::post(
+        'canteen-tables/{id}/restore',
+        [CanteenTableController::class, 'restore']
+    )->whereNumber('id');
+
+    Route::apiResource(
+        'canteen-tables',
+        CanteenTableController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -272,7 +318,9 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::apiResource(
         'order-items',
         OrderItemController::class
-    )->except(['store']);
+    )->except([
+        'store',
+    ]);
 
     Route::post(
         'order-items/{id}/restore',
