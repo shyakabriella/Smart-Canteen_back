@@ -86,6 +86,14 @@ Route::post(
     ->whereUuid('qrToken')
     ->middleware('throttle:60,1');
 
+
+Route::post(
+    'table-action-events/public/{tableActionEvent}/acknowledge',
+    [TableActionEventController::class, 'acknowledgePublic']
+)
+    ->whereNumber('tableActionEvent')
+    ->middleware('throttle:240,1');
+
 /*
 |--------------------------------------------------------------------------
 | Protected API Routes
@@ -185,6 +193,47 @@ Route::middleware('auth:sanctum')->group(function () {
         'canteen-tables',
         CanteenTableController::class
     );
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Table Action Event Routes
+    |--------------------------------------------------------------------------
+    |
+    | These routes are protected for administrative and staff management.
+    | The TV screen uses the public routes declared above.
+    |
+    */
+
+    Route::get(
+        'table-action-events',
+        [TableActionEventController::class, 'index']
+    );
+
+    Route::get(
+        'table-action-events/{tableActionEvent}',
+        [TableActionEventController::class, 'show']
+    )->whereNumber('tableActionEvent');
+
+    Route::post(
+        'table-action-events/{tableActionEvent}/acknowledge',
+        [TableActionEventController::class, 'acknowledge']
+    )->whereNumber('tableActionEvent');
+
+    Route::post(
+        'table-action-events/{tableActionEvent}/complete',
+        [TableActionEventController::class, 'complete']
+    )->whereNumber('tableActionEvent');
+
+    Route::post(
+        'table-action-events/{tableActionEvent}/cancel',
+        [TableActionEventController::class, 'cancel']
+    )->whereNumber('tableActionEvent');
+
+    Route::delete(
+        'table-action-events/{tableActionEvent}',
+        [TableActionEventController::class, 'destroy']
+    )->whereNumber('tableActionEvent');
 
     /*
     |--------------------------------------------------------------------------
