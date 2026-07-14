@@ -21,6 +21,7 @@ use App\Http\Controllers\API\SalesReportController;
 use App\Http\Controllers\API\InventoryReportController;
 use App\Http\Controllers\API\ActivityLogController;
 use App\Http\Controllers\API\SystemSettingController;
+use App\Http\Controllers\API\TableActionEventController;
 
 /*
 |--------------------------------------------------------------------------
@@ -58,6 +59,32 @@ Route::get(
     'canteen-tables/public/{qrToken}',
     [CanteenTableController::class, 'publicShow']
 )->whereUuid('qrToken');
+
+
+/*
+|--------------------------------------------------------------------------
+| Public Table Action Routes
+|--------------------------------------------------------------------------
+|
+| These endpoints are public because a customer uses them after scanning
+| the unique QR code assigned to a canteen table.
+|
+| GET  /api/table-action-events/public
+| POST /api/canteen-tables/public/{qrToken}/actions
+|
+*/
+
+Route::get(
+    'table-action-events/public',
+    [TableActionEventController::class, 'publicIndex']
+);
+
+Route::post(
+    'canteen-tables/public/{qrToken}/actions',
+    [TableActionEventController::class, 'storePublic']
+)
+    ->whereUuid('qrToken')
+    ->middleware('throttle:60,1');
 
 /*
 |--------------------------------------------------------------------------

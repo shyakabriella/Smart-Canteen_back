@@ -13,25 +13,97 @@ use Illuminate\Validation\Rule;
 class TableActionEventController extends BaseController
 {
     /**
-     * Public live activity feed.
+     * Display public table activity.
+     *
+     * GET /api/table-action-events/public
+     *
+     * Supported query parameters:
+     * - action=order|call|pay|cancel
+     * - status=pending|acknowledged|completed|cancelled
+     * - table_id=1
+     * - after_id=10
+     * - limit=100
      */
     public function publicIndex(Request $request): JsonResponse
     {
-        $limit = min(
-            max((int) $request->integer('limit', 100), 1),
-            200
+        $validator = Validator::make(
+            $request->query(),
+            [
+                'action' => [
+                    'nullable',
+                    Rule::in([
+                        TableActionEvent::ACTION_ORDER,
+                        TableActionEvent::ACTION_CALL,
+                        TableActionEvent::ACTION_PAY,
+                        TableActionEvent::ACTION_CANCEL,
+                    ]),
+                ],
+
+                'status' => [
+                    'nullable',
+                    Rule::in([
+                        TableActionEvent::STATUS_PENDING,
+                        TableActionEvent::STATUS_ACKNOWLEDGED,
+                        TableActionEvent::STATUS_COMPLETED,
+                        TableActionEvent::STATUS_CANCELLED,
+                    ]),
+                ],
+
+                'table_id' => [
+                    'nullable',
+                    'integer',
+                    'min:1',
+                ],
+
+                'after_id' => [
+                    'nullable',
+                    'integer',
+                    'min:1',
+                ],
+
+                'limit' => [
+                    'nullable',
+                    'integer',
+                    'min:1',
+                    'max:200',
+                ],
+            ]
         );
+
+        if ($validator->fails()) {
+            return $this->sendError(
+                'Validation failed.',
+                $validator->errors(),
+                422
+            );
+        }
+
+        $limit = (int) $request->integer('limit', 100);
 
         $query = TableActionEvent::query()
             ->with([
-                'table:id,table_number,name,location,status',
+                'table:id,table_number,name,location,capacity,status,qr_token',
             ])
-            ->latest('id');
+            ->orderByDesc('id');
 
         if ($request->filled('action')) {
             $query->where(
                 'action',
                 (string) $request->query('action')
+            );
+        }
+
+        if ($request->filled('status')) {
+            $query->where(
+                'status',
+                (string) $request->query('status')
+            );
+        }
+
+        if ($request->filled('table_id')) {
+            $query->where(
+                'canteen_table_id',
+                (int) $request->query('table_id')
             );
         }
 
@@ -49,37 +121,65 @@ class TableActionEventController extends BaseController
 
         $today = now()->toDateString();
 
-        $summaryQuery = TableActionEvent::query()
+        $todayQuery = TableActionEvent::query()
             ->whereDate('occurred_at', $today);
 
         $summary = [
-            'all' => (clone $summaryQuery)->count(),
+            'all' => (clone $todayQuery)->count(),
 
-            'order' => (clone $summaryQuery)
+            'order' => (clone $todayQuery)
                 ->where(
                     'action',
                     TableActionEvent::ACTION_ORDER
                 )
                 ->count(),
 
-            'call' => (clone $summaryQuery)
+            'call' => (clone $todayQuery)
                 ->where(
                     'action',
                     TableActionEvent::ACTION_CALL
                 )
                 ->count(),
 
-            'pay' => (clone $summaryQuery)
+            'pay' => (clone $todayQuery)
                 ->where(
                     'action',
                     TableActionEvent::ACTION_PAY
                 )
                 ->count(),
 
-            'cancel' => (clone $summaryQuery)
+            'cancel' => (clone $todayQuery)
                 ->where(
                     'action',
                     TableActionEvent::ACTION_CANCEL
+                )
+                ->count(),
+
+            'pending' => (clone $todayQuery)
+                ->where(
+                    'status',
+                    TableActionEvent::STATUS_PENDING
+                )
+                ->count(),
+
+            'acknowledged' => (clone $todayQuery)
+                ->where(
+                    'status',
+                    TableActionEvent::STATUS_ACKNOWLEDGED
+                )
+                ->count(),
+
+            'completed' => (clone $todayQuery)
+                ->where(
+                    'status',
+                    TableActionEvent::STATUS_COMPLETED
+                )
+                ->count(),
+
+            'cancelled' => (clone $todayQuery)
+                ->where(
+                    'status',
+                    TableActionEvent::STATUS_CANCELLED
                 )
                 ->count(),
         ];
@@ -95,7 +195,15 @@ class TableActionEventController extends BaseController
     }
 
     /**
-     * Store a public action from a table QR screen.
+     * Store a public action sent from a table QR screen.
+     *
+     * POST /api/canteen-tables/public/{qrToken}/actions
+     *
+     * Request body:
+     * {
+     *   "action": "call",
+     *   "message": "Optional message"
+     * }
      */
     public function storePublic(
         Request $request,
@@ -136,15 +244,17 @@ class TableActionEventController extends BaseController
 
         if (!$table) {
             return $this->sendError(
-                'Table not found.',
+                'Canteen table not found.',
                 [],
                 404
             );
         }
 
-        if ($table->status === 'inactive') {
+        if (
+            strtolower((string) $table->status) === 'inactive'
+        ) {
             return $this->sendError(
-                'This table is inactive.',
+                'This canteen table is inactive.',
                 [],
                 422
             );
@@ -152,17 +262,37 @@ class TableActionEventController extends BaseController
 
         $action = (string) $request->input('action');
 
+        $status = $action === TableActionEvent::ACTION_CANCEL
+            ? TableActionEvent::STATUS_CANCELLED
+            : TableActionEvent::STATUS_PENDING;
+
+        $defaultMessage = match ($action) {
+            TableActionEvent::ACTION_ORDER =>
+                "Table {$table->table_number} requested to place an order.",
+
+            TableActionEvent::ACTION_CALL =>
+                "Table {$table->table_number} requested staff assistance.",
+
+            TableActionEvent::ACTION_PAY =>
+                "Table {$table->table_number} requested payment assistance.",
+
+            TableActionEvent::ACTION_CANCEL =>
+                "Table {$table->table_number} cancelled the current request.",
+
+            default =>
+                "Table {$table->table_number} sent an action.",
+        };
+
         $event = TableActionEvent::query()->create([
             'canteen_table_id' => $table->id,
 
             'action' => $action,
 
-            'status' =>
-                $action === TableActionEvent::ACTION_CANCEL
-                    ? TableActionEvent::STATUS_CANCELLED
-                    : TableActionEvent::STATUS_PENDING,
+            'status' => $status,
 
-            'message' => $request->input('message'),
+            'message' => $request->filled('message')
+                ? (string) $request->input('message')
+                : $defaultMessage,
 
             'source_ip' => $request->ip(),
 
@@ -176,12 +306,187 @@ class TableActionEventController extends BaseController
         ]);
 
         $event->load([
-            'table:id,table_number,name,location,status',
+            'table:id,table_number,name,location,capacity,status,qr_token',
         ]);
 
         return $this->sendResponse(
             $event,
             'Table action received successfully.'
+        );
+    }
+
+    /**
+     * Display protected table activity.
+     *
+     * GET /api/table-action-events
+     */
+    public function index(Request $request): JsonResponse
+    {
+        $query = TableActionEvent::query()
+            ->with([
+                'table:id,table_number,name,location,capacity,status,qr_token',
+            ])
+            ->orderByDesc('id');
+
+        if ($request->filled('action')) {
+            $query->where(
+                'action',
+                (string) $request->query('action')
+            );
+        }
+
+        if ($request->filled('status')) {
+            $query->where(
+                'status',
+                (string) $request->query('status')
+            );
+        }
+
+        if ($request->filled('table_id')) {
+            $query->where(
+                'canteen_table_id',
+                (int) $request->query('table_id')
+            );
+        }
+
+        $perPage = min(
+            max((int) $request->integer('per_page', 20), 1),
+            100
+        );
+
+        $events = $query->paginate($perPage);
+
+        return $this->sendResponse(
+            $events,
+            'Table action events loaded successfully.'
+        );
+    }
+
+    /**
+     * Display one event.
+     *
+     * GET /api/table-action-events/{tableActionEvent}
+     */
+    public function show(
+        TableActionEvent $tableActionEvent
+    ): JsonResponse {
+        $tableActionEvent->load([
+            'table:id,table_number,name,location,capacity,status,qr_token',
+        ]);
+
+        return $this->sendResponse(
+            $tableActionEvent,
+            'Table action event loaded successfully.'
+        );
+    }
+
+    /**
+     * Mark an action as acknowledged.
+     *
+     * POST /api/table-action-events/{tableActionEvent}/acknowledge
+     */
+    public function acknowledge(
+        TableActionEvent $tableActionEvent
+    ): JsonResponse {
+        if (
+            $tableActionEvent->status ===
+            TableActionEvent::STATUS_CANCELLED
+        ) {
+            return $this->sendError(
+                'A cancelled action cannot be acknowledged.',
+                [],
+                422
+            );
+        }
+
+        $tableActionEvent->update([
+            'status' =>
+                TableActionEvent::STATUS_ACKNOWLEDGED,
+            'handled_at' => now(),
+        ]);
+
+        $tableActionEvent->load([
+            'table:id,table_number,name,location,capacity,status,qr_token',
+        ]);
+
+        return $this->sendResponse(
+            $tableActionEvent,
+            'Table action acknowledged successfully.'
+        );
+    }
+
+    /**
+     * Mark an action as completed.
+     *
+     * POST /api/table-action-events/{tableActionEvent}/complete
+     */
+    public function complete(
+        TableActionEvent $tableActionEvent
+    ): JsonResponse {
+        if (
+            $tableActionEvent->status ===
+            TableActionEvent::STATUS_CANCELLED
+        ) {
+            return $this->sendError(
+                'A cancelled action cannot be completed.',
+                [],
+                422
+            );
+        }
+
+        $tableActionEvent->update([
+            'status' =>
+                TableActionEvent::STATUS_COMPLETED,
+            'handled_at' => now(),
+        ]);
+
+        $tableActionEvent->load([
+            'table:id,table_number,name,location,capacity,status,qr_token',
+        ]);
+
+        return $this->sendResponse(
+            $tableActionEvent,
+            'Table action completed successfully.'
+        );
+    }
+
+    /**
+     * Cancel an existing action.
+     *
+     * POST /api/table-action-events/{tableActionEvent}/cancel
+     */
+    public function cancel(
+        TableActionEvent $tableActionEvent
+    ): JsonResponse {
+        $tableActionEvent->update([
+            'status' =>
+                TableActionEvent::STATUS_CANCELLED,
+            'handled_at' => now(),
+        ]);
+
+        $tableActionEvent->load([
+            'table:id,table_number,name,location,capacity,status,qr_token',
+        ]);
+
+        return $this->sendResponse(
+            $tableActionEvent,
+            'Table action cancelled successfully.'
+        );
+    }
+
+    /**
+     * Delete an action event.
+     *
+     * DELETE /api/table-action-events/{tableActionEvent}
+     */
+    public function destroy(
+        TableActionEvent $tableActionEvent
+    ): JsonResponse {
+        $tableActionEvent->delete();
+
+        return $this->sendResponse(
+            [],
+            'Table action event deleted successfully.'
         );
     }
 }
