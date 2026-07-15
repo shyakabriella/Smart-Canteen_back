@@ -2,7 +2,6 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Controllers\API\BaseController;
 use App\Models\QrScanLog;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -12,6 +11,8 @@ class QrScanLogController extends BaseController
 {
     /**
      * Display QR scan logs.
+     *
+     * Students can only see logs related to their own account.
      */
     public function index(Request $request): JsonResponse
     {
@@ -26,7 +27,6 @@ class QrScanLogController extends BaseController
             ])
             ->orderByDesc('id');
 
-        // Student can only see logs related to their own QR/order
         if (!$authUser->canManageOrders()) {
             $query->where('user_id', $authUser->id);
         }
@@ -43,7 +43,10 @@ class QrScanLogController extends BaseController
             $query->where('order_qr_code_id', $request->order_qr_code_id);
         }
 
-        if ($request->filled('scanned_by') && $authUser->canManageOrders()) {
+        if (
+            $request->filled('scanned_by') &&
+            $authUser->canManageOrders()
+        ) {
             $query->where('scanned_by', $request->scanned_by);
         }
 
@@ -64,38 +67,54 @@ class QrScanLogController extends BaseController
         }
 
         if ($request->filled('search')) {
-            $query->where(function ($q) use ($request) {
-                $q->where('qr_code_number', 'like', '%' . $request->search . '%')
-                    ->orWhere('qr_token', 'like', '%' . $request->search . '%')
-                    ->orWhere('message', 'like', '%' . $request->search . '%')
-                    ->orWhere('failure_reason', 'like', '%' . $request->search . '%')
-                    ->orWhereHas('order', function ($orderQuery) use ($request) {
-                        $orderQuery->where('order_number', 'like', '%' . $request->search . '%');
+            $search = trim((string) $request->search);
+
+            $query->where(function ($q) use ($search) {
+                $q->where('qr_code_number', 'like', '%' . $search . '%')
+                    ->orWhere('qr_token', 'like', '%' . $search . '%')
+                    ->orWhere('message', 'like', '%' . $search . '%')
+                    ->orWhere('failure_reason', 'like', '%' . $search . '%')
+                    ->orWhereHas('order', function ($orderQuery) use ($search) {
+                        $orderQuery->where(
+                            'order_number',
+                            'like',
+                            '%' . $search . '%'
+                        );
                     })
-                    ->orWhereHas('user', function ($userQuery) use ($request) {
-                        $userQuery->where('name', 'like', '%' . $request->search . '%')
-                            ->orWhere('email', 'like', '%' . $request->search . '%')
-                            ->orWhere('phone', 'like', '%' . $request->search . '%');
+                    ->orWhereHas('user', function ($userQuery) use ($search) {
+                        $userQuery
+                            ->where('name', 'like', '%' . $search . '%')
+                            ->orWhere('email', 'like', '%' . $search . '%')
+                            ->orWhere('phone', 'like', '%' . $search . '%');
                     });
             });
         }
 
-        $perPage = $request->get('per_page', 20);
-
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
         $logs = $query->paginate($perPage);
 
-        return $this->sendResponse($logs, 'QR scan logs retrieved successfully.');
+        return $this->sendResponse(
+            $logs,
+            'QR scan logs retrieved successfully.'
+        );
     }
 
     /**
      * Display one QR scan log.
      */
-    public function show(Request $request, QrScanLog $qrScanLog): JsonResponse
-    {
+    public function show(
+        Request $request,
+        QrScanLog $qrScanLog
+    ): JsonResponse {
         $authUser = $request->user();
 
-        if (!$authUser->canManageOrders() && $qrScanLog->user_id !== $authUser->id) {
-            return $this->sendForbidden('You can only view your own QR scan logs.');
+        if (
+            !$authUser->canManageOrders() &&
+            $qrScanLog->user_id !== $authUser->id
+        ) {
+            return $this->sendForbidden(
+                'You can only view your own QR scan logs.'
+            );
         }
 
         $qrScanLog->load([
@@ -106,48 +125,36 @@ class QrScanLogController extends BaseController
             'scannedBy:id,name,email,phone,role',
         ]);
 
-        return $this->sendResponse($qrScanLog, 'QR scan log retrieved successfully.');
+        return $this->sendResponse(
+            $qrScanLog,
+            'QR scan log retrieved successfully.'
+        );
     }
 
     /**
-     * Delete QR scan log.
+     * QR scan logs are immutable audit records.
      */
-    public function destroy(Request $request, QrScanLog $qrScanLog): JsonResponse
-    {
-        if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can delete QR scan logs.');
-        }
-
-        $qrScanLog->delete();
-
-        return $this->sendResponse([], 'QR scan log deleted successfully.');
+    public function destroy(
+        Request $request,
+        QrScanLog $qrScanLog
+    ): JsonResponse {
+        return $this->sendError(
+            'QR scan logs are audit records and cannot be deleted.',
+            [],
+            405
+        );
     }
 
     /**
-     * Restore deleted QR scan log.
+     * QR scan logs are immutable audit records.
      */
     public function restore(Request $request, int $id): JsonResponse
     {
-        if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can restore QR scan logs.');
-        }
-
-        $log = QrScanLog::onlyTrashed()->find($id);
-
-        if (!$log) {
-            return $this->sendNotFound('Deleted QR scan log not found.');
-        }
-
-        $log->restore();
-
-        $log->load([
-            'orderQrCode:id,order_id,user_id,qr_code_number,status',
-            'order:id,user_id,order_number,total_amount,payment_status,order_status,pickup_status',
-            'user:id,name,email,phone,role,status',
-            'scannedBy:id,name,email,phone,role',
-        ]);
-
-        return $this->sendResponse($log, 'QR scan log restored successfully.');
+        return $this->sendError(
+            'QR scan logs are audit records and cannot be restored because deletion is disabled.',
+            [],
+            405
+        );
     }
 
     /**
@@ -156,7 +163,9 @@ class QrScanLogController extends BaseController
     public function summary(Request $request): JsonResponse
     {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can view QR scan summary.');
+            return $this->sendForbidden(
+                'Only admin or staff can view QR scan summary.'
+            );
         }
 
         $query = QrScanLog::query();
@@ -182,7 +191,7 @@ class QrScanLogController extends BaseController
             ])
             ->count();
 
-        $failedScans = $totalScans - $successfulScans;
+        $failedScans = max(0, $totalScans - $successfulScans);
 
         $byStatus = (clone $query)
             ->select('scan_status', DB::raw('COUNT(*) as total_records'))

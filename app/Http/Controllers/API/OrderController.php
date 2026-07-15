@@ -2,12 +2,15 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Controllers\API\BaseController;
+use App\Models\FoodCategory;
 use App\Models\FoodItem;
 use App\Models\InventoryStock;
+use App\Models\LowStockAlert;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\OrderQrCode;
+use App\Models\PickupConfirmation;
+use App\Models\QrScanLog;
 use App\Models\StockMovement;
 use App\Models\User;
 use App\Models\WalletTransaction;
@@ -27,19 +30,9 @@ class OrderController extends BaseController
         $authUser = $request->user();
 
         $query = Order::query()
-            ->with([
-                'user:id,name,email,phone,role,status,wallet_balance',
-                'orderItems.foodItem:id,name,sku,price,unit',
-                'qrCode',
-                'confirmedBy:id,name,email,phone,role',
-                'readyBy:id,name,email,phone,role',
-                'completedBy:id,name,email,phone,role',
-                'cancelledBy:id,name,email,phone,role',
-                'walletTransactions',
-            ])
+            ->with($this->defaultRelations())
             ->orderByDesc('id');
 
-        // Students can only see their own orders
         if (!$authUser->canManageOrders()) {
             $query->where('user_id', $authUser->id);
         }
@@ -48,20 +41,15 @@ class OrderController extends BaseController
             $query->where('user_id', $request->user_id);
         }
 
-        if ($request->filled('order_status')) {
-            $query->where('order_status', $request->order_status);
-        }
-
-        if ($request->filled('payment_status')) {
-            $query->where('payment_status', $request->payment_status);
-        }
-
-        if ($request->filled('pickup_status')) {
-            $query->where('pickup_status', $request->pickup_status);
-        }
-
-        if ($request->filled('order_type')) {
-            $query->where('order_type', $request->order_type);
+        foreach ([
+            'order_status',
+            'payment_status',
+            'pickup_status',
+            'order_type',
+        ] as $field) {
+            if ($request->filled($field)) {
+                $query->where($field, $request->input($field));
+            }
         }
 
         if ($request->filled('from_date')) {
@@ -73,99 +61,134 @@ class OrderController extends BaseController
         }
 
         if ($request->filled('search')) {
-            $query->where(function ($q) use ($request) {
-                $q->where('order_number', 'like', '%' . $request->search . '%')
-                    ->orWhereHas('user', function ($userQuery) use ($request) {
-                        $userQuery->where('name', 'like', '%' . $request->search . '%')
-                            ->orWhere('email', 'like', '%' . $request->search . '%')
-                            ->orWhere('phone', 'like', '%' . $request->search . '%');
+            $search = trim((string) $request->search);
+
+            $query->where(function ($q) use ($search) {
+                $q->where('order_number', 'like', '%' . $search . '%')
+                    ->orWhereHas('user', function ($userQuery) use ($search) {
+                        $userQuery
+                            ->where('name', 'like', '%' . $search . '%')
+                            ->orWhere('email', 'like', '%' . $search . '%')
+                            ->orWhere('phone', 'like', '%' . $search . '%');
                     });
             });
         }
 
-        $perPage = $request->get('per_page', 20);
-
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
         $orders = $query->paginate($perPage);
 
-        return $this->sendResponse($orders, 'Orders retrieved successfully.');
+        return $this->sendResponse(
+            $orders,
+            'Orders retrieved successfully.'
+        );
     }
 
     /**
-     * Store order with order items, wallet payment,
-     * stock reduction, stock movement, and QR code.
+     * Create an order, pay by wallet, reduce available stock,
+     * create stock movements, and generate the pickup QR code.
      */
     public function store(Request $request): JsonResponse
     {
         $authUser = $request->user();
 
         $validator = Validator::make($request->all(), [
-            // Admin/staff can create order for another user. Student creates own order.
-            'user_id' => 'nullable|exists:users,id',
-
-            'order_type' => 'nullable|in:pickup,dine_in,takeaway',
-            'payment_method' => 'nullable|in:wallet',
-
-            'discount_amount' => 'nullable|numeric|min:0',
-            'tax_amount' => 'nullable|numeric|min:0',
-
-            'customer_notes' => 'nullable|string',
-            'staff_notes' => 'nullable|string',
-
-            'items' => 'required|array|min:1',
-            'items.*.food_item_id' => 'required|exists:food_items,id',
-            'items.*.quantity' => 'required|integer|min:1',
-            'items.*.notes' => 'nullable|string',
+            'user_id' => ['nullable', 'integer', 'exists:users,id'],
+            'order_type' => ['nullable', 'in:pickup,dine_in,takeaway'],
+            'payment_method' => ['nullable', 'in:wallet'],
+            'discount_amount' => ['nullable', 'numeric', 'min:0'],
+            'tax_amount' => ['nullable', 'numeric', 'min:0'],
+            'customer_notes' => ['nullable', 'string'],
+            'staff_notes' => ['nullable', 'string'],
+            'items' => ['required', 'array', 'min:1'],
+            'items.*.food_item_id' => [
+                'required',
+                'integer',
+                'distinct',
+                'exists:food_items,id',
+            ],
+            'items.*.quantity' => ['required', 'integer', 'min:1'],
+            'items.*.notes' => ['nullable', 'string'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
         $targetUserId = $authUser->canManageOrders()
-            ? ($request->user_id ?? $authUser->id)
-            : $authUser->id;
+            ? (int) ($request->user_id ?? $authUser->id)
+            : (int) $authUser->id;
 
         try {
-            $order = DB::transaction(function () use ($request, $authUser, $targetUserId) {
-                $customer = User::lockForUpdate()->findOrFail($targetUserId);
+            $order = DB::transaction(function () use (
+                $request,
+                $authUser,
+                $targetUserId
+            ) {
+                $customer = User::query()
+                    ->whereKey($targetUserId)
+                    ->lockForUpdate()
+                    ->firstOrFail();
 
                 if (!$customer->isActive()) {
-                    throw new \Exception('Customer account is not active.');
+                    throw new \RuntimeException(
+                        'Customer account is not active.'
+                    );
                 }
 
-                $subtotal = 0;
+                $subtotal = 0.0;
                 $preparedItems = [];
 
                 foreach ($request->items as $itemData) {
                     $foodItem = FoodItem::query()
-                        ->with('inventoryStock')
-                        ->where('id', $itemData['food_item_id'])
+                        ->with('category:id,status')
+                        ->whereKey($itemData['food_item_id'])
                         ->lockForUpdate()
                         ->firstOrFail();
 
-                    if (!$foodItem->isActive() || !$foodItem->isAvailable()) {
-                        throw new \Exception($foodItem->name . ' is not available.');
+                    if (
+                        !$foodItem->isActive() ||
+                        !$foodItem->isAvailable() ||
+                        !$foodItem->category ||
+                        $foodItem->category->status !== FoodCategory::STATUS_ACTIVE
+                    ) {
+                        throw new \RuntimeException(
+                            $foodItem->name . ' is not available.'
+                        );
                     }
 
-                    $stock = InventoryStock::where('food_item_id', $foodItem->id)
+                    $stock = InventoryStock::query()
+                        ->where('food_item_id', $foodItem->id)
                         ->lockForUpdate()
                         ->first();
 
                     if (!$stock) {
-                        throw new \Exception('Stock record not found for ' . $foodItem->name . '.');
+                        throw new \RuntimeException(
+                            'Stock record not found for ' . $foodItem->name . '.'
+                        );
+                    }
+
+                    if ($stock->status !== InventoryStock::STATUS_ACTIVE) {
+                        throw new \RuntimeException(
+                            'Stock is inactive for ' . $foodItem->name . '.'
+                        );
                     }
 
                     $quantity = (int) $itemData['quantity'];
+                    $availableQuantity = $this->availableQuantity($stock);
 
-                    if ($stock->quantity < $quantity) {
-                        throw new \Exception(
-                            'Not enough stock for ' . $foodItem->name . '. Available: ' . $stock->quantity
+                    if ($availableQuantity < $quantity) {
+                        throw new \RuntimeException(
+                            'Not enough available stock for ' .
+                            $foodItem->name . '. Available: ' .
+                            $availableQuantity . '.'
                         );
                     }
 
                     $unitPrice = (float) $foodItem->price;
                     $lineSubtotal = $unitPrice * $quantity;
-
                     $subtotal += $lineSubtotal;
 
                     $preparedItems[] = [
@@ -178,40 +201,53 @@ class OrderController extends BaseController
                     ];
                 }
 
-                $discount = (float) ($request->discount_amount ?? 0);
-                $tax = (float) ($request->tax_amount ?? 0);
+                $discount = $authUser->canManageOrders()
+                    ? (float) ($request->discount_amount ?? 0)
+                    : 0.0;
+
+                $tax = $authUser->canManageOrders()
+                    ? (float) ($request->tax_amount ?? 0)
+                    : 0.0;
+
+                if ($discount > $subtotal) {
+                    throw new \RuntimeException(
+                        'Discount amount cannot exceed the subtotal.'
+                    );
+                }
+
                 $total = ($subtotal - $discount) + $tax;
 
                 if ($total <= 0) {
-                    throw new \Exception('Order total must be greater than zero.');
+                    throw new \RuntimeException(
+                        'Order total must be greater than zero.'
+                    );
                 }
 
                 $balanceBefore = (float) $customer->wallet_balance;
 
                 if ($total > $balanceBefore) {
-                    throw new \Exception('Not enough wallet balance.');
+                    throw new \RuntimeException(
+                        'Not enough wallet balance.'
+                    );
                 }
 
                 $order = Order::create([
                     'user_id' => $customer->id,
                     'order_number' => $this->generateOrderNumber(),
                     'order_type' => $request->order_type ?? Order::TYPE_PICKUP,
-
                     'subtotal_amount' => $subtotal,
                     'discount_amount' => $discount,
                     'tax_amount' => $tax,
                     'total_amount' => $total,
                     'paid_amount' => $total,
-
                     'payment_method' => Order::PAYMENT_METHOD_WALLET,
                     'payment_status' => Order::PAYMENT_PAID,
-
                     'order_status' => Order::STATUS_CONFIRMED,
                     'pickup_status' => Order::PICKUP_PENDING,
-
                     'customer_notes' => $request->customer_notes,
-                    'staff_notes' => $request->staff_notes,
-
+                    'staff_notes' => $authUser->canManageOrders()
+                        ? $request->staff_notes
+                        : null,
                     'ordered_at' => now(),
                     'paid_at' => now(),
                     'confirmed_by' => $authUser->id,
@@ -219,35 +255,32 @@ class OrderController extends BaseController
                 ]);
 
                 foreach ($preparedItems as $preparedItem) {
+                    /** @var FoodItem $foodItem */
                     $foodItem = $preparedItem['food_item'];
+                    /** @var InventoryStock $stock */
                     $stock = $preparedItem['stock'];
                     $quantity = $preparedItem['quantity'];
 
                     OrderItem::create([
                         'order_id' => $order->id,
                         'food_item_id' => $foodItem->id,
-
                         'food_name' => $foodItem->name,
                         'food_sku' => $foodItem->sku,
                         'unit' => $foodItem->unit,
-
                         'quantity' => $quantity,
                         'unit_price' => $preparedItem['unit_price'],
                         'cost_price' => $foodItem->cost_price,
-
                         'subtotal_amount' => $preparedItem['line_subtotal'],
                         'discount_amount' => 0,
                         'tax_amount' => 0,
                         'total_amount' => $preparedItem['line_subtotal'],
-
                         'item_status' => OrderItem::STATUS_CONFIRMED,
                         'notes' => $preparedItem['notes'],
-
                         'created_by' => $authUser->id,
                         'updated_by' => $authUser->id,
                     ]);
 
-                    $quantityBefore = $stock->quantity;
+                    $quantityBefore = (int) $stock->quantity;
                     $quantityAfter = $quantityBefore - $quantity;
 
                     $stock->update([
@@ -263,7 +296,9 @@ class OrderController extends BaseController
                         'quantity_change' => -abs($quantity),
                         'quantity_after' => $quantityAfter,
                         'unit_cost' => $foodItem->cost_price,
-                        'total_cost' => $foodItem->cost_price ? $foodItem->cost_price * $quantity : null,
+                        'total_cost' => $foodItem->cost_price !== null
+                            ? (float) $foodItem->cost_price * $quantity
+                            : null,
                         'reference_type' => 'order',
                         'reference_id' => $order->id,
                         'reference_number' => $order->order_number,
@@ -273,6 +308,9 @@ class OrderController extends BaseController
                         'created_by' => $authUser->id,
                         'updated_by' => $authUser->id,
                     ]);
+
+                    $stock->load('foodItem');
+                    $this->syncLowStockAlert($stock, $authUser->id);
                 }
 
                 $balanceAfter = $balanceBefore - $total;
@@ -299,7 +337,6 @@ class OrderController extends BaseController
                     'processed_at' => now(),
                 ]);
 
-                // Create QR code automatically for pickup
                 $qrToken = $this->generateQrToken();
                 $qrCodeNumber = $this->generateQrCodeNumber();
 
@@ -308,7 +345,11 @@ class OrderController extends BaseController
                     'user_id' => $customer->id,
                     'qr_code_number' => $qrCodeNumber,
                     'qr_token' => $qrToken,
-                    'qr_payload' => $this->buildQrPayload($order, $qrCodeNumber, $qrToken),
+                    'qr_payload' => $this->buildQrPayload(
+                        $order,
+                        $qrCodeNumber,
+                        $qrToken
+                    ),
                     'qr_image' => null,
                     'status' => OrderQrCode::STATUS_ACTIVE,
                     'expires_at' => now()->addDay(),
@@ -325,16 +366,13 @@ class OrderController extends BaseController
                 return $order;
             });
 
-            $order->load([
-                'user:id,name,email,phone,role,status,wallet_balance',
-                'orderItems.foodItem:id,name,sku,price,unit',
-                'qrCode',
-                'confirmedBy:id,name,email,phone,role',
-                'walletTransactions',
-            ]);
+            $order->load($this->defaultRelations());
 
-            return $this->sendCreated($order, 'Order created successfully.');
-        } catch (\Exception $e) {
+            return $this->sendCreated(
+                $order,
+                'Order created successfully.'
+            );
+        } catch (\Throwable $e) {
             return $this->sendError($e->getMessage(), [], 400);
         }
     }
@@ -346,79 +384,95 @@ class OrderController extends BaseController
     {
         $authUser = $request->user();
 
-        if (!$authUser->canManageOrders() && $order->user_id !== $authUser->id) {
-            return $this->sendForbidden('You can only view your own orders.');
+        if (
+            !$authUser->canManageOrders() &&
+            $order->user_id !== $authUser->id
+        ) {
+            return $this->sendForbidden(
+                'You can only view your own orders.'
+            );
         }
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-            'confirmedBy:id,name,email,phone,role',
-            'readyBy:id,name,email,phone,role',
-            'completedBy:id,name,email,phone,role',
-            'cancelledBy:id,name,email,phone,role',
-            'walletTransactions',
-        ]);
+        $order->load($this->defaultRelations());
 
-        return $this->sendResponse($order, 'Order retrieved successfully.');
+        return $this->sendResponse(
+            $order,
+            'Order retrieved successfully.'
+        );
     }
 
     /**
-     * Update order notes only.
+     * Update order notes without changing payment or stock fields.
      */
     public function update(Request $request, Order $order): JsonResponse
     {
         $authUser = $request->user();
 
-        if (!$authUser->canManageOrders() && $order->user_id !== $authUser->id) {
-            return $this->sendForbidden('You can only update your own order notes.');
+        if (
+            !$authUser->canManageOrders() &&
+            $order->user_id !== $authUser->id
+        ) {
+            return $this->sendForbidden(
+                'You can only update your own order notes.'
+            );
         }
 
         if ($order->isCompleted() || $order->isCancelled()) {
-            return $this->sendError('Completed or cancelled orders cannot be updated.', [], 400);
+            return $this->sendError(
+                'Completed or cancelled orders cannot be updated.',
+                [],
+                400
+            );
         }
 
         $validator = Validator::make($request->all(), [
-            'customer_notes' => 'nullable|string',
-            'staff_notes' => 'nullable|string',
+            'customer_notes' => ['sometimes', 'nullable', 'string'],
+            'staff_notes' => ['sometimes', 'nullable', 'string'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
         $data = [];
 
-        if (!$authUser->canManageOrders()) {
+        if ($request->has('customer_notes')) {
             $data['customer_notes'] = $request->customer_notes;
-        } else {
-            $data['customer_notes'] = $request->customer_notes ?? $order->customer_notes;
-            $data['staff_notes'] = $request->staff_notes ?? $order->staff_notes;
+        }
+
+        if ($authUser->canManageOrders() && $request->has('staff_notes')) {
+            $data['staff_notes'] = $request->staff_notes;
         }
 
         $order->update($data);
+        $order->load($this->defaultRelations());
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-        ]);
-
-        return $this->sendResponse($order, 'Order updated successfully.');
+        return $this->sendResponse(
+            $order,
+            'Order updated successfully.'
+        );
     }
 
     /**
-     * Delete order.
+     * Delete only a cancelled order.
      */
     public function destroy(Request $request, Order $order): JsonResponse
     {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can delete orders.');
+            return $this->sendForbidden(
+                'Only admin or staff can delete orders.'
+            );
         }
 
-        if ($order->isCompleted()) {
-            return $this->sendError('Completed orders cannot be deleted.', [], 400);
+        if (!$order->isCancelled()) {
+            return $this->sendError(
+                'Cancel the order before deleting it.',
+                [],
+                400
+            );
         }
 
         $order->delete();
@@ -427,204 +481,393 @@ class OrderController extends BaseController
     }
 
     /**
-     * Mark order as preparing.
+     * Move CONFIRMED -> PREPARING.
      */
-    public function markPreparing(Request $request, Order $order): JsonResponse
-    {
+    public function markPreparing(
+        Request $request,
+        Order $order
+    ): JsonResponse {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can update order preparation status.');
+            return $this->sendForbidden(
+                'Only admin or staff can update order preparation status.'
+            );
         }
 
-        if ($order->isCancelled() || $order->isCompleted()) {
-            return $this->sendError('This order cannot be marked as preparing.', [], 400);
+        if ($order->order_status !== Order::STATUS_CONFIRMED) {
+            return $this->sendError(
+                'Only confirmed orders can be marked as preparing.',
+                [],
+                400
+            );
         }
 
         $order->update([
             'order_status' => Order::STATUS_PREPARING,
         ]);
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-        ]);
+        $order->load($this->defaultRelations());
 
-        return $this->sendResponse($order, 'Order marked as preparing successfully.');
+        return $this->sendResponse(
+            $order,
+            'Order marked as preparing successfully.'
+        );
     }
 
     /**
-     * Mark order as ready for pickup.
+     * Move PREPARING -> READY and mark items prepared.
      */
-    public function markReady(Request $request, Order $order): JsonResponse
-    {
+    public function markReady(
+        Request $request,
+        Order $order
+    ): JsonResponse {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can mark orders as ready.');
+            return $this->sendForbidden(
+                'Only admin or staff can mark orders as ready.'
+            );
         }
 
-        if ($order->isCancelled() || $order->isCompleted()) {
-            return $this->sendError('This order cannot be marked as ready.', [], 400);
+        if ($order->order_status !== Order::STATUS_PREPARING) {
+            return $this->sendError(
+                'Only preparing orders can be marked as ready.',
+                [],
+                400
+            );
         }
 
-        $order->update([
-            'order_status' => Order::STATUS_READY,
-            'pickup_status' => Order::PICKUP_READY,
-            'ready_by' => $request->user()->id,
-            'ready_at' => now(),
-        ]);
+        DB::transaction(function () use ($request, $order) {
+            $lockedOrder = Order::query()
+                ->whereKey($order->id)
+                ->lockForUpdate()
+                ->firstOrFail();
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-            'readyBy:id,name,email,phone,role',
-        ]);
+            if ($lockedOrder->order_status !== Order::STATUS_PREPARING) {
+                throw new \RuntimeException(
+                    'The order status changed. Refresh and try again.'
+                );
+            }
 
-        return $this->sendResponse($order, 'Order marked as ready successfully.');
+            $lockedOrder->update([
+                'order_status' => Order::STATUS_READY,
+                'pickup_status' => Order::PICKUP_READY,
+                'ready_by' => $request->user()->id,
+                'ready_at' => now(),
+            ]);
+
+            $lockedOrder->orderItems()->update([
+                'item_status' => 'prepared',
+                'updated_by' => $request->user()->id,
+            ]);
+        });
+
+        $order->refresh()->load($this->defaultRelations());
+
+        return $this->sendResponse(
+            $order,
+            'Order marked as ready successfully.'
+        );
     }
 
     /**
-     * Complete order after customer collects food.
+     * Complete a ready order using its QR record.
+     *
+     * This endpoint performs the same official pickup records as QR mark-used:
+     * QR used, order completed, items collected, scan log, and confirmation.
      */
     public function complete(Request $request, Order $order): JsonResponse
     {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can complete orders.');
+            return $this->sendForbidden(
+                'Only admin or staff can complete orders.'
+            );
         }
 
-        if ($order->isCancelled()) {
-            return $this->sendError('Cancelled order cannot be completed.', [], 400);
-        }
-
-        if ($order->isCompleted()) {
-            return $this->sendError('Order is already completed.', [], 400);
-        }
-
-        if ($order->payment_status !== Order::PAYMENT_PAID) {
-            return $this->sendError('Only paid orders can be completed.', [], 400);
-        }
-
-        $order->update([
-            'order_status' => Order::STATUS_COMPLETED,
-            'pickup_status' => Order::PICKUP_COLLECTED,
-            'completed_by' => $request->user()->id,
-            'completed_at' => now(),
+        $validator = Validator::make($request->all(), [
+            'device_name' => ['nullable', 'string', 'max:255'],
+            'device_type' => ['nullable', 'string', 'max:100'],
+            'location' => ['nullable', 'string', 'max:255'],
+            'scanned_payload' => ['nullable', 'string'],
+            'notes' => ['nullable', 'string'],
         ]);
 
-        $order->orderItems()->update([
-            'item_status' => OrderItem::STATUS_COLLECTED,
-            'updated_by' => $request->user()->id,
-        ]);
-
-        $order->load('qrCode');
-
-        if ($order->qrCode && $order->qrCode->status === OrderQrCode::STATUS_ACTIVE) {
-            $order->qrCode->update([
-                'status' => OrderQrCode::STATUS_USED,
-                'used_at' => now(),
-                'scanned_by' => $request->user()->id,
-                'scanned_at' => now(),
-                'updated_by' => $request->user()->id,
-            ]);
+        if ($validator->fails()) {
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-            'completedBy:id,name,email,phone,role',
-        ]);
+        try {
+            $order = DB::transaction(function () use ($request, $order) {
+                $lockedOrder = Order::with(['user', 'orderItems'])
+                    ->whereKey($order->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
 
-        return $this->sendResponse($order, 'Order completed successfully.');
+                if (
+                    $lockedOrder->order_status !== Order::STATUS_READY ||
+                    $lockedOrder->pickup_status !== Order::PICKUP_READY
+                ) {
+                    throw new \RuntimeException(
+                        'Only an order that is ready for pickup can be completed.'
+                    );
+                }
+
+                if ($lockedOrder->payment_status !== Order::PAYMENT_PAID) {
+                    throw new \RuntimeException(
+                        'Only paid orders can be completed.'
+                    );
+                }
+
+                if (
+                    PickupConfirmation::where('order_id', $lockedOrder->id)
+                        ->exists()
+                ) {
+                    throw new \RuntimeException(
+                        'Pickup has already been confirmed for this order.'
+                    );
+                }
+
+                $qrCode = OrderQrCode::query()
+                    ->where('order_id', $lockedOrder->id)
+                    ->lockForUpdate()
+                    ->first();
+
+                if (!$qrCode) {
+                    throw new \RuntimeException(
+                        'Pickup QR code was not found for this order.'
+                    );
+                }
+
+                if ($qrCode->isCancelled()) {
+                    throw new \RuntimeException(
+                        'Cancelled QR code cannot be used.'
+                    );
+                }
+
+                if ($qrCode->isUsed()) {
+                    throw new \RuntimeException(
+                        'This QR code has already been used.'
+                    );
+                }
+
+                if ($qrCode->isExpired()) {
+                    $qrCode->update([
+                        'status' => OrderQrCode::STATUS_EXPIRED,
+                        'updated_by' => $request->user()->id,
+                    ]);
+
+                    throw new \RuntimeException(
+                        'This QR code has expired.'
+                    );
+                }
+
+                $qrCode->update([
+                    'status' => OrderQrCode::STATUS_USED,
+                    'used_at' => now(),
+                    'scanned_by' => $request->user()->id,
+                    'scanned_at' => now(),
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                $scanLog = QrScanLog::create([
+                    'order_qr_code_id' => $qrCode->id,
+                    'order_id' => $lockedOrder->id,
+                    'user_id' => $lockedOrder->user_id,
+                    'scanned_by' => $request->user()->id,
+                    'scan_action' => QrScanLog::ACTION_COLLECT,
+                    'scan_status' => QrScanLog::STATUS_SUCCESS,
+                    'qr_code_number' => $qrCode->qr_code_number,
+                    'qr_token' => $qrCode->qr_token,
+                    'scanned_payload' => $request->scanned_payload
+                        ?? $qrCode->qr_payload,
+                    'message' => 'Order completed and pickup confirmed successfully.',
+                    'failure_reason' => null,
+                    'device_name' => $request->device_name,
+                    'device_type' => $request->device_type,
+                    'ip_address' => $request->ip(),
+                    'user_agent' => $request->userAgent(),
+                    'location' => $request->location,
+                    'scanned_at' => now(),
+                ]);
+
+                $lockedOrder->update([
+                    'order_status' => Order::STATUS_COMPLETED,
+                    'pickup_status' => Order::PICKUP_COLLECTED,
+                    'completed_by' => $request->user()->id,
+                    'completed_at' => now(),
+                ]);
+
+                $lockedOrder->orderItems()->update([
+                    'item_status' => OrderItem::STATUS_COLLECTED,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                PickupConfirmation::create([
+                    'order_id' => $lockedOrder->id,
+                    'order_qr_code_id' => $qrCode->id,
+                    'qr_scan_log_id' => $scanLog->id,
+                    'user_id' => $lockedOrder->user_id,
+                    'confirmation_number' => $this->generatePickupConfirmationNumber(),
+                    'confirmation_method' => PickupConfirmation::METHOD_QR_SCAN,
+                    'status' => PickupConfirmation::STATUS_CONFIRMED,
+                    'customer_name' => $lockedOrder->user?->name,
+                    'customer_phone' => $lockedOrder->user?->phone,
+                    'order_number' => $lockedOrder->order_number,
+                    'qr_code_number' => $qrCode->qr_code_number,
+                    'confirmed_by' => $request->user()->id,
+                    'confirmed_at' => now(),
+                    'device_name' => $request->device_name,
+                    'device_type' => $request->device_type,
+                    'ip_address' => $request->ip(),
+                    'user_agent' => $request->userAgent(),
+                    'location' => $request->location,
+                    'notes' => $request->notes
+                        ?? 'Pickup confirmed from the order completion endpoint.',
+                    'created_by' => $request->user()->id,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                return $lockedOrder;
+            });
+        } catch (\Throwable $e) {
+            return $this->sendError($e->getMessage(), [], 400);
+        }
+
+        $order->load($this->defaultRelations());
+
+        return $this->sendResponse(
+            $order,
+            'Order completed and pickup confirmed successfully.'
+        );
     }
 
     /**
-     * Cancel order, refund wallet, return stock, and cancel QR code.
+     * Cancel an eligible order, return stock, refund wallet, and cancel QR.
      */
     public function cancel(Request $request, Order $order): JsonResponse
     {
         $authUser = $request->user();
 
-        if (!$authUser->canManageOrders() && $order->user_id !== $authUser->id) {
-            return $this->sendForbidden('You can only cancel your own order.');
-        }
-
-        if (!$order->canBeCancelled()) {
-            return $this->sendError('This order cannot be cancelled.', [], 400);
+        if (
+            !$authUser->canManageOrders() &&
+            $order->user_id !== $authUser->id
+        ) {
+            return $this->sendForbidden(
+                'You can only cancel your own order.'
+            );
         }
 
         $validator = Validator::make($request->all(), [
-            'cancellation_reason' => 'nullable|string',
+            'cancellation_reason' => ['nullable', 'string'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
         try {
-            $order = DB::transaction(function () use ($request, $authUser, $order) {
-                $order = Order::with([
-                        'orderItems.foodItem',
-                        'qrCode',
-                    ])
+            $order = DB::transaction(function () use (
+                $request,
+                $authUser,
+                $order
+            ) {
+                $lockedOrder = Order::query()
+                    ->whereKey($order->id)
                     ->lockForUpdate()
-                    ->findOrFail($order->id);
+                    ->firstOrFail();
 
-                // Return stock for each order item
-                foreach ($order->orderItems as $orderItem) {
+                if (!$lockedOrder->canBeCancelled()) {
+                    throw new \RuntimeException(
+                        'This order cannot be cancelled.'
+                    );
+                }
+
+                $orderItems = $lockedOrder->orderItems()
+                    ->withTrashed()
+                    ->get();
+
+                foreach ($orderItems as $orderItem) {
                     if ($orderItem->isCancelled()) {
                         continue;
                     }
 
-                    $stock = InventoryStock::where('food_item_id', $orderItem->food_item_id)
+                    $stock = InventoryStock::query()
+                        ->where('food_item_id', $orderItem->food_item_id)
                         ->lockForUpdate()
                         ->first();
 
-                    if ($stock) {
-                        $quantityBefore = $stock->quantity;
-                        $quantityAfter = $quantityBefore + $orderItem->quantity;
-
-                        $stock->update([
-                            'quantity' => $quantityAfter,
-                            'updated_by' => $authUser->id,
-                        ]);
-
-                        StockMovement::create([
-                            'inventory_stock_id' => $stock->id,
-                            'food_item_id' => $orderItem->food_item_id,
-                            'movement_type' => StockMovement::TYPE_RETURN,
-                            'quantity_before' => $quantityBefore,
-                            'quantity_change' => $orderItem->quantity,
-                            'quantity_after' => $quantityAfter,
-                            'unit_cost' => $orderItem->cost_price,
-                            'total_cost' => $orderItem->cost_price
-                                ? $orderItem->cost_price * $orderItem->quantity
-                                : null,
-                            'reference_type' => 'order_cancel',
-                            'reference_id' => $order->id,
-                            'reference_number' => $order->order_number,
-                            'reason' => 'Order cancelled',
-                            'notes' => $request->cancellation_reason,
-                            'movement_date' => now(),
-                            'created_by' => $authUser->id,
-                            'updated_by' => $authUser->id,
-                        ]);
+                    if (!$stock) {
+                        throw new \RuntimeException(
+                            'Stock record not found for ' .
+                            $orderItem->food_name . '.'
+                        );
                     }
+
+                    $quantityBefore = (int) $stock->quantity;
+                    $quantityReturned = (int) $orderItem->quantity;
+                    $quantityAfter = $quantityBefore + $quantityReturned;
+
+                    $stock->update([
+                        'quantity' => $quantityAfter,
+                        'updated_by' => $authUser->id,
+                    ]);
+
+                    StockMovement::create([
+                        'inventory_stock_id' => $stock->id,
+                        'food_item_id' => $orderItem->food_item_id,
+                        'movement_type' => StockMovement::TYPE_RETURN,
+                        'quantity_before' => $quantityBefore,
+                        'quantity_change' => $quantityReturned,
+                        'quantity_after' => $quantityAfter,
+                        'unit_cost' => $orderItem->cost_price,
+                        'total_cost' => $orderItem->cost_price !== null
+                            ? (float) $orderItem->cost_price * $quantityReturned
+                            : null,
+                        'reference_type' => 'order_cancel',
+                        'reference_id' => $lockedOrder->id,
+                        'reference_number' => $lockedOrder->order_number,
+                        'reason' => 'Order cancelled',
+                        'notes' => $request->cancellation_reason,
+                        'movement_date' => now(),
+                        'created_by' => $authUser->id,
+                        'updated_by' => $authUser->id,
+                    ]);
 
                     $orderItem->update([
                         'item_status' => OrderItem::STATUS_CANCELLED,
                         'updated_by' => $authUser->id,
                     ]);
+
+                    $stock->load('foodItem');
+                    $this->syncLowStockAlert($stock, $authUser->id);
                 }
 
-                // Refund wallet payment
                 if (
-                    $order->payment_method === Order::PAYMENT_METHOD_WALLET &&
-                    $order->payment_status === Order::PAYMENT_PAID
+                    $lockedOrder->payment_method === Order::PAYMENT_METHOD_WALLET &&
+                    $lockedOrder->payment_status === Order::PAYMENT_PAID
                 ) {
-                    $customer = User::lockForUpdate()->findOrFail($order->user_id);
+                    $customer = User::query()
+                        ->whereKey($lockedOrder->user_id)
+                        ->lockForUpdate()
+                        ->firstOrFail();
+
+                    $refundExists = WalletTransaction::query()
+                        ->where('source_type', WalletTransaction::SOURCE_REFUND)
+                        ->where('source_id', $lockedOrder->id)
+                        ->where('status', WalletTransaction::STATUS_COMPLETED)
+                        ->exists();
+
+                    if ($refundExists) {
+                        throw new \RuntimeException(
+                            'This order has already been refunded.'
+                        );
+                    }
 
                     $balanceBefore = (float) $customer->wallet_balance;
-                    $refundAmount = (float) $order->paid_amount;
+                    $refundAmount = (float) $lockedOrder->paid_amount;
                     $balanceAfter = $balanceBefore + $refundAmount;
 
                     $customer->update([
@@ -637,8 +880,8 @@ class OrderController extends BaseController
                         'transaction_number' => $this->generateWalletTransactionNumber(),
                         'transaction_type' => WalletTransaction::TYPE_CREDIT,
                         'source_type' => WalletTransaction::SOURCE_REFUND,
-                        'source_id' => $order->id,
-                        'reference_number' => $order->order_number,
+                        'source_id' => $lockedOrder->id,
+                        'reference_number' => $lockedOrder->order_number,
                         'amount' => $refundAmount,
                         'balance_before' => $balanceBefore,
                         'balance_after' => $balanceAfter,
@@ -649,12 +892,16 @@ class OrderController extends BaseController
                         'processed_at' => now(),
                     ]);
 
-                    $order->payment_status = Order::PAYMENT_REFUNDED;
+                    $lockedOrder->payment_status = Order::PAYMENT_REFUNDED;
                 }
 
-                // Cancel QR code
-                if ($order->qrCode && !$order->qrCode->isUsed()) {
-                    $order->qrCode->update([
+                $qrCode = OrderQrCode::query()
+                    ->where('order_id', $lockedOrder->id)
+                    ->lockForUpdate()
+                    ->first();
+
+                if ($qrCode && !$qrCode->isUsed()) {
+                    $qrCode->update([
                         'status' => OrderQrCode::STATUS_CANCELLED,
                         'cancelled_by' => $authUser->id,
                         'cancelled_at' => now(),
@@ -663,40 +910,36 @@ class OrderController extends BaseController
                     ]);
                 }
 
-                $order->order_status = Order::STATUS_CANCELLED;
-                $order->pickup_status = Order::PICKUP_CANCELLED;
-                $order->cancelled_by = $authUser->id;
-                $order->cancelled_at = now();
-                $order->cancellation_reason = $request->cancellation_reason;
-                $order->save();
+                $lockedOrder->order_status = Order::STATUS_CANCELLED;
+                $lockedOrder->pickup_status = Order::PICKUP_CANCELLED;
+                $lockedOrder->cancelled_by = $authUser->id;
+                $lockedOrder->cancelled_at = now();
+                $lockedOrder->cancellation_reason = $request->cancellation_reason;
+                $lockedOrder->save();
 
-                return $order;
+                return $lockedOrder;
             });
-
-            $order->load([
-                'user:id,name,email,phone,role,status,wallet_balance',
-                'orderItems.foodItem:id,name,sku,price,unit',
-                'qrCode',
-                'cancelledBy:id,name,email,phone,role',
-                'walletTransactions',
-            ]);
-
-            return $this->sendResponse(
-                $order,
-                'Order cancelled, wallet refunded, stock returned, and QR code cancelled successfully.'
-            );
-        } catch (\Exception $e) {
+        } catch (\Throwable $e) {
             return $this->sendError($e->getMessage(), [], 400);
         }
+
+        $order->load($this->defaultRelations());
+
+        return $this->sendResponse(
+            $order,
+            'Order cancelled, wallet refunded, stock returned, and QR code cancelled successfully.'
+        );
     }
 
     /**
-     * Restore deleted order.
+     * Restore a soft-deleted order.
      */
     public function restore(Request $request, int $id): JsonResponse
     {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can restore orders.');
+            return $this->sendForbidden(
+                'Only admin or staff can restore orders.'
+            );
         }
 
         $order = Order::onlyTrashed()->find($id);
@@ -705,15 +948,21 @@ class OrderController extends BaseController
             return $this->sendNotFound('Deleted order not found.');
         }
 
+        if (!$order->isCancelled()) {
+            return $this->sendError(
+                'Only a cancelled order history record can be restored.',
+                [],
+                400
+            );
+        }
+
         $order->restore();
+        $order->load($this->defaultRelations());
 
-        $order->load([
-            'user:id,name,email,phone,role,status,wallet_balance',
-            'orderItems.foodItem:id,name,sku,price,unit',
-            'qrCode',
-        ]);
-
-        return $this->sendResponse($order, 'Order restored successfully.');
+        return $this->sendResponse(
+            $order,
+            'Order restored successfully.'
+        );
     }
 
     /**
@@ -722,7 +971,6 @@ class OrderController extends BaseController
     public function summary(Request $request): JsonResponse
     {
         $authUser = $request->user();
-
         $query = Order::query();
 
         if (!$authUser->canManageOrders()) {
@@ -742,24 +990,21 @@ class OrderController extends BaseController
         }
 
         $totalOrders = (clone $query)->count();
-
         $paidOrders = (clone $query)
             ->where('payment_status', Order::PAYMENT_PAID)
             ->count();
-
         $completedOrders = (clone $query)
             ->where('order_status', Order::STATUS_COMPLETED)
             ->count();
-
         $cancelledOrders = (clone $query)
             ->where('order_status', Order::STATUS_CANCELLED)
             ->count();
 
-        $totalSales = (clone $query)
+        $totalSales = (float) (clone $query)
             ->where('payment_status', Order::PAYMENT_PAID)
             ->sum('paid_amount');
 
-        $refundedAmount = (clone $query)
+        $refundedAmount = (float) (clone $query)
             ->where('payment_status', Order::PAYMENT_REFUNDED)
             ->sum('paid_amount');
 
@@ -795,9 +1040,126 @@ class OrderController extends BaseController
         ], 'Order summary retrieved successfully.');
     }
 
+    private function defaultRelations(): array
+    {
+        return [
+            'user:id,name,email,phone,role,status,wallet_balance',
+            'orderItems.foodItem:id,name,sku,price,unit',
+            'qrCode',
+            'confirmedBy:id,name,email,phone,role',
+            'readyBy:id,name,email,phone,role',
+            'completedBy:id,name,email,phone,role',
+            'cancelledBy:id,name,email,phone,role',
+            'walletTransactions',
+        ];
+    }
+
+    private function availableQuantity(InventoryStock $stock): int
+    {
+        return max(
+            0,
+            (int) $stock->quantity - (int) $stock->reserved_quantity
+        );
+    }
+
+    private function thresholdQuantity(InventoryStock $stock): int
+    {
+        if ($stock->low_stock_quantity !== null) {
+            return (int) $stock->low_stock_quantity;
+        }
+
+        if (
+            $stock->foodItem &&
+            $stock->foodItem->low_stock_quantity !== null
+        ) {
+            return (int) $stock->foodItem->low_stock_quantity;
+        }
+
+        return 5;
+    }
+
     /**
-     * Generate unique order number.
+     * Keep low-stock alerts current after order sales and returns.
      */
+    private function syncLowStockAlert(
+        InventoryStock $stock,
+        int $userId
+    ): void {
+        if (!$stock->relationLoaded('foodItem')) {
+            $stock->load('foodItem');
+        }
+
+        $available = $this->availableQuantity($stock);
+        $threshold = $this->thresholdQuantity($stock);
+
+        $activeAlert = LowStockAlert::query()
+            ->where('inventory_stock_id', $stock->id)
+            ->where('status', LowStockAlert::STATUS_ACTIVE)
+            ->lockForUpdate()
+            ->first();
+
+        if (
+            $stock->status === InventoryStock::STATUS_ACTIVE &&
+            $available <= $threshold
+        ) {
+            $alertType = $available <= 0
+                ? LowStockAlert::TYPE_OUT_OF_STOCK
+                : LowStockAlert::TYPE_LOW_STOCK;
+
+            $severity = $available <= 0
+                ? LowStockAlert::SEVERITY_CRITICAL
+                : (
+                    $available <= max(1, (int) floor($threshold / 2))
+                        ? LowStockAlert::SEVERITY_HIGH
+                        : LowStockAlert::SEVERITY_MEDIUM
+                );
+
+            $foodName = $stock->foodItem?->name ?? 'Food item';
+            $message = $available <= 0
+                ? $foodName . ' is out of stock. Available quantity is 0.'
+                : $foodName . ' is low in stock. Available quantity is ' .
+                    $available . ', threshold is ' . $threshold . '.';
+
+            if ($activeAlert) {
+                $activeAlert->update([
+                    'alert_type' => $alertType,
+                    'severity' => $severity,
+                    'current_quantity' => $available,
+                    'threshold_quantity' => $threshold,
+                    'message' => $message,
+                    'updated_by' => $userId,
+                ]);
+            } else {
+                LowStockAlert::create([
+                    'inventory_stock_id' => $stock->id,
+                    'food_item_id' => $stock->food_item_id,
+                    'alert_number' => $this->generateLowStockAlertNumber(),
+                    'alert_type' => $alertType,
+                    'severity' => $severity,
+                    'current_quantity' => $available,
+                    'threshold_quantity' => $threshold,
+                    'status' => LowStockAlert::STATUS_ACTIVE,
+                    'message' => $message,
+                    'notes' => 'Generated automatically after an order stock change.',
+                    'created_by' => $userId,
+                    'updated_by' => $userId,
+                ]);
+            }
+
+            return;
+        }
+
+        if ($activeAlert) {
+            $activeAlert->update([
+                'status' => LowStockAlert::STATUS_RESOLVED,
+                'resolved_by' => $userId,
+                'resolved_at' => now(),
+                'resolution_notes' => 'Auto-resolved because available stock is now above the threshold.',
+                'updated_by' => $userId,
+            ]);
+        }
+    }
+
     private function generateOrderNumber(): string
     {
         do {
@@ -807,9 +1169,6 @@ class OrderController extends BaseController
         return $number;
     }
 
-    /**
-     * Generate unique wallet transaction number.
-     */
     private function generateWalletTransactionNumber(): string
     {
         do {
@@ -819,9 +1178,6 @@ class OrderController extends BaseController
         return $number;
     }
 
-    /**
-     * Generate unique QR code number.
-     */
     private function generateQrCodeNumber(): string
     {
         do {
@@ -831,9 +1187,6 @@ class OrderController extends BaseController
         return $number;
     }
 
-    /**
-     * Generate secure QR token.
-     */
     private function generateQrToken(): string
     {
         do {
@@ -843,19 +1196,35 @@ class OrderController extends BaseController
         return $token;
     }
 
-    /**
-     * Build QR payload.
-     *
-     * Frontend/mobile app will convert this payload into QR image.
-     */
-    private function buildQrPayload(Order $order, string $qrCodeNumber, string $qrToken): string
+    private function generatePickupConfirmationNumber(): string
     {
+        do {
+            $number = 'PUC-' . now()->format('Ymd') . '-' . strtoupper(Str::random(8));
+        } while (PickupConfirmation::where('confirmation_number', $number)->exists());
+
+        return $number;
+    }
+
+    private function generateLowStockAlertNumber(): string
+    {
+        do {
+            $number = 'LSA-' . now()->format('Ymd') . '-' . strtoupper(Str::random(8));
+        } while (LowStockAlert::where('alert_number', $number)->exists());
+
+        return $number;
+    }
+
+    private function buildQrPayload(
+        Order $order,
+        string $qrCodeNumber,
+        string $qrToken
+    ): string {
         return json_encode([
             'type' => 'smart_canteen_order_pickup',
             'order_id' => $order->id,
             'order_number' => $order->order_number,
             'qr_code_number' => $qrCodeNumber,
             'qr_token' => $qrToken,
-        ]);
+        ], JSON_UNESCAPED_SLASHES);
     }
 }

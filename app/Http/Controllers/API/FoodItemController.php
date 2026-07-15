@@ -2,8 +2,9 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Controllers\API\BaseController;
+use App\Models\FoodCategory;
 use App\Models\FoodItem;
+use App\Models\InventoryStock;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
@@ -14,31 +15,61 @@ use Illuminate\Validation\Rule;
 class FoodItemController extends BaseController
 {
     /**
-     * Display all food items.
+     * Display food items.
+     *
+     * Students only receive items that are active, manually available,
+     * inside an active category, and have available stock.
      */
     public function index(Request $request): JsonResponse
     {
+        $authUser = $request->user();
+        $canManage = $authUser?->canManageInventory() ?? false;
+
         $query = FoodItem::query()
             ->with([
                 'category:id,name,slug,status',
+                'inventoryStock:id,food_item_id,quantity,reserved_quantity,low_stock_quantity,status,location',
                 'createdBy:id,name,email,phone,role',
                 'updatedBy:id,name,email,phone,role',
             ])
             ->orderBy('sort_order')
             ->orderBy('name');
 
-        /*
-         * Include soft-deleted records when requested.
-         *
-         * Examples:
-         * ?with_trashed=1
-         * ?include_deleted=1
-         */
-        if (
-            $request->boolean('with_trashed') ||
-            $request->boolean('include_deleted')
-        ) {
-            $query->withTrashed();
+        if ($canManage) {
+            if (
+                $request->boolean('with_trashed') ||
+                $request->boolean('include_deleted')
+            ) {
+                $query->withTrashed();
+            }
+
+            if ($request->filled('status')) {
+                $query->where('status', $request->status);
+            }
+
+            if ($request->has('is_available')) {
+                $query->where(
+                    'is_available',
+                    $request->boolean('is_available')
+                );
+            }
+        } else {
+            $query
+                ->where('status', FoodItem::STATUS_ACTIVE)
+                ->where('is_available', true)
+                ->whereHas('category', function ($categoryQuery) {
+                    $categoryQuery->where(
+                        'status',
+                        FoodCategory::STATUS_ACTIVE
+                    );
+                })
+                ->whereHas('inventoryStock', function ($stockQuery) {
+                    $stockQuery
+                        ->where('status', InventoryStock::STATUS_ACTIVE)
+                        ->whereRaw(
+                            '(quantity - COALESCE(reserved_quantity, 0)) > 0'
+                        );
+                });
         }
 
         if ($request->filled('food_category_id')) {
@@ -48,41 +79,21 @@ class FoodItemController extends BaseController
             );
         }
 
-        if ($request->filled('status')) {
-            $query->where('status', $request->status);
-        }
-
-        if ($request->has('is_available')) {
-            $query->where(
-                'is_available',
-                $request->boolean('is_available')
-            );
-        }
-
         if ($request->filled('search')) {
             $search = trim((string) $request->search);
 
             $query->where(function ($q) use ($search) {
                 $q->where('name', 'like', '%' . $search . '%')
                     ->orWhere('sku', 'like', '%' . $search . '%')
-                    ->orWhere(
-                        'description',
-                        'like',
-                        '%' . $search . '%'
-                    );
+                    ->orWhere('description', 'like', '%' . $search . '%');
             });
         }
 
-        $perPage = min(
-            max((int) $request->get('per_page', 20), 1),
-            200
-        );
-
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
         $foodItems = $query->paginate($perPage);
 
         $foodItems->getCollection()->transform(
-            fn (FoodItem $foodItem) =>
-                $this->prepareFoodItemResponse($foodItem)
+            fn (FoodItem $foodItem) => $this->prepareFoodItemResponse($foodItem)
         );
 
         return $this->sendResponse(
@@ -96,66 +107,42 @@ class FoodItemController extends BaseController
      */
     public function store(Request $request): JsonResponse
     {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can create food items.'
+            );
+        }
+
         $validator = Validator::make($request->all(), [
             'food_category_id' => [
                 'required',
                 'integer',
-                'exists:food_categories,id',
+                Rule::exists('food_categories', 'id')
+                    ->whereNull('deleted_at'),
             ],
-
             'name' => [
                 'required',
                 'string',
                 'max:255',
                 Rule::unique('food_items', 'name'),
             ],
-
             'sku' => [
                 'nullable',
                 'string',
                 'max:100',
                 Rule::unique('food_items', 'sku'),
             ],
-
-            'description' => [
-                'nullable',
-                'string',
-            ],
-
-            /*
-             * The frontend now sends an actual image file.
-             */
+            'description' => ['nullable', 'string'],
             'image' => [
                 'nullable',
                 'image',
                 'mimes:jpg,jpeg,png,webp',
                 'max:5120',
             ],
-
-            'price' => [
-                'required',
-                'numeric',
-                'min:0',
-            ],
-
-            'cost_price' => [
-                'nullable',
-                'numeric',
-                'min:0',
-            ],
-
-            'unit' => [
-                'nullable',
-                'string',
-                'max:50',
-            ],
-
-            'low_stock_quantity' => [
-                'nullable',
-                'integer',
-                'min:0',
-            ],
-
+            'price' => ['required', 'numeric', 'min:0'],
+            'cost_price' => ['nullable', 'numeric', 'min:0'],
+            'unit' => ['nullable', 'string', 'max:50'],
+            'low_stock_quantity' => ['nullable', 'integer', 'min:0'],
             'status' => [
                 'nullable',
                 Rule::in([
@@ -163,23 +150,9 @@ class FoodItemController extends BaseController
                     FoodItem::STATUS_INACTIVE,
                 ]),
             ],
-
-            'is_available' => [
-                'nullable',
-                'boolean',
-            ],
-
-            'preparation_time_minutes' => [
-                'nullable',
-                'integer',
-                'min:0',
-            ],
-
-            'sort_order' => [
-                'nullable',
-                'integer',
-                'min:0',
-            ],
+            'is_available' => ['nullable', 'boolean'],
+            'preparation_time_minutes' => ['nullable', 'integer', 'min:0'],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
         ]);
 
         if ($validator->fails()) {
@@ -192,51 +165,38 @@ class FoodItemController extends BaseController
         $imagePath = null;
 
         if ($request->hasFile('image')) {
-            $imagePath = $request
-                ->file('image')
-                ->store('food-items', 'public');
+            $imagePath = $request->file('image')->store(
+                'food-items',
+                'public'
+            );
         }
 
+        $name = trim((string) $request->name);
+
         $foodItem = FoodItem::create([
-            'food_category_id' => $request->food_category_id,
-            'name' => trim((string) $request->name),
-            'slug' => $this->generateUniqueSlug(
-                trim((string) $request->name)
-            ),
+            'food_category_id' => (int) $request->food_category_id,
+            'name' => $name,
+            'slug' => $this->generateUniqueSlug($name),
             'sku' => $request->filled('sku')
                 ? trim((string) $request->sku)
                 : null,
             'description' => $request->description,
             'image' => $imagePath,
-
             'price' => $request->price,
             'cost_price' => $request->cost_price,
             'unit' => $request->unit ?? 'piece',
-
-            'low_stock_quantity' =>
-                $request->low_stock_quantity ?? 5,
-
-            'status' =>
-                $request->status ?? FoodItem::STATUS_ACTIVE,
-
+            'low_stock_quantity' => $request->low_stock_quantity ?? 5,
+            'status' => $request->status ?? FoodItem::STATUS_ACTIVE,
             'is_available' => $request->has('is_available')
                 ? $request->boolean('is_available')
                 : true,
-
-            'preparation_time_minutes' =>
-                $request->preparation_time_minutes,
-
+            'preparation_time_minutes' => $request->preparation_time_minutes,
             'sort_order' => $request->sort_order ?? 0,
-
             'created_by' => $request->user()->id,
             'updated_by' => $request->user()->id,
         ]);
 
-        $foodItem->load([
-            'category:id,name,slug,status',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        $foodItem->load($this->defaultRelations());
 
         return $this->sendCreated(
             $this->prepareFoodItemResponse($foodItem),
@@ -247,13 +207,27 @@ class FoodItemController extends BaseController
     /**
      * Display one food item.
      */
-    public function show(FoodItem $foodItem): JsonResponse
-    {
-        $foodItem->load([
-            'category:id,name,slug,status',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+    public function show(
+        Request $request,
+        FoodItem $foodItem
+    ): JsonResponse {
+        $foodItem->load($this->defaultRelations());
+
+        if (!$request->user()->canManageInventory()) {
+            $availableQuantity = $this->availableQuantity($foodItem);
+
+            if (
+                !$foodItem->isActive() ||
+                !$foodItem->isAvailable() ||
+                !$foodItem->category ||
+                $foodItem->category->status !== FoodCategory::STATUS_ACTIVE ||
+                !$foodItem->inventoryStock ||
+                $foodItem->inventoryStock->status !== InventoryStock::STATUS_ACTIVE ||
+                $availableQuantity <= 0
+            ) {
+                return $this->sendNotFound('Food item not found.');
+            }
+        }
 
         return $this->sendResponse(
             $this->prepareFoodItemResponse($foodItem),
@@ -263,94 +237,72 @@ class FoodItemController extends BaseController
 
     /**
      * Update a food item.
+     *
+     * Supports PUT and PATCH without clearing omitted fields.
      */
     public function update(
         Request $request,
         FoodItem $foodItem
     ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can update food items.'
+            );
+        }
+
         $validator = Validator::make($request->all(), [
             'food_category_id' => [
+                'sometimes',
                 'required',
                 'integer',
-                'exists:food_categories,id',
+                Rule::exists('food_categories', 'id')
+                    ->whereNull('deleted_at'),
             ],
-
             'name' => [
+                'sometimes',
                 'required',
                 'string',
                 'max:255',
                 Rule::unique('food_items', 'name')
                     ->ignore($foodItem->id),
             ],
-
             'sku' => [
+                'sometimes',
                 'nullable',
                 'string',
                 'max:100',
                 Rule::unique('food_items', 'sku')
                     ->ignore($foodItem->id),
             ],
-
-            'description' => [
-                'nullable',
-                'string',
-            ],
-
+            'description' => ['sometimes', 'nullable', 'string'],
             'image' => [
+                'sometimes',
                 'nullable',
                 'image',
                 'mimes:jpg,jpeg,png,webp',
                 'max:5120',
             ],
-
-            'price' => [
-                'required',
-                'numeric',
-                'min:0',
-            ],
-
-            'cost_price' => [
-                'nullable',
-                'numeric',
-                'min:0',
-            ],
-
-            'unit' => [
-                'nullable',
-                'string',
-                'max:50',
-            ],
-
-            'low_stock_quantity' => [
-                'nullable',
-                'integer',
-                'min:0',
-            ],
-
+            'remove_image' => ['sometimes', 'boolean'],
+            'price' => ['sometimes', 'required', 'numeric', 'min:0'],
+            'cost_price' => ['sometimes', 'nullable', 'numeric', 'min:0'],
+            'unit' => ['sometimes', 'nullable', 'string', 'max:50'],
+            'low_stock_quantity' => ['sometimes', 'nullable', 'integer', 'min:0'],
             'status' => [
-                'nullable',
+                'sometimes',
+                'required',
                 Rule::in([
                     FoodItem::STATUS_ACTIVE,
                     FoodItem::STATUS_INACTIVE,
                 ]),
             ],
-
-            'is_available' => [
-                'nullable',
-                'boolean',
-            ],
-
+            'is_available' => ['sometimes', 'required', 'boolean'],
             'preparation_time_minutes' => [
+                'sometimes',
                 'nullable',
                 'integer',
                 'min:0',
             ],
-
-            'sort_order' => [
-                'nullable',
-                'integer',
-                'min:0',
-            ],
+            'sort_order' => ['sometimes', 'required', 'integer', 'min:0'],
         ]);
 
         if ($validator->fails()) {
@@ -360,64 +312,63 @@ class FoodItemController extends BaseController
             );
         }
 
-        $imagePath = $foodItem->image;
+        $data = [];
 
-        /*
-         * Only replace the current image when a new file is uploaded.
-         */
-        if ($request->hasFile('image')) {
-            $newImagePath = $request
-                ->file('image')
-                ->store('food-items', 'public');
-
-            $this->deleteStoredImage($foodItem->image);
-
-            $imagePath = $newImagePath;
+        if ($request->has('food_category_id')) {
+            $data['food_category_id'] = (int) $request->food_category_id;
         }
 
-        $foodItem->update([
-            'food_category_id' => $request->food_category_id,
-            'name' => trim((string) $request->name),
-            'slug' => $this->generateUniqueSlug(
-                trim((string) $request->name),
+        if ($request->has('name')) {
+            $name = trim((string) $request->name);
+            $data['name'] = $name;
+            $data['slug'] = $this->generateUniqueSlug(
+                $name,
                 $foodItem->id
-            ),
-            'sku' => $request->filled('sku')
+            );
+        }
+
+        if ($request->has('sku')) {
+            $data['sku'] = $request->filled('sku')
                 ? trim((string) $request->sku)
-                : null,
-            'description' => $request->description,
-            'image' => $imagePath,
+                : null;
+        }
 
-            'price' => $request->price,
-            'cost_price' => $request->cost_price,
-            'unit' => $request->unit ?? $foodItem->unit,
+        foreach ([
+            'description',
+            'price',
+            'cost_price',
+            'unit',
+            'low_stock_quantity',
+            'status',
+            'preparation_time_minutes',
+            'sort_order',
+        ] as $field) {
+            if ($request->has($field)) {
+                $data[$field] = $request->input($field);
+            }
+        }
 
-            'low_stock_quantity' =>
-                $request->low_stock_quantity ??
-                $foodItem->low_stock_quantity,
+        if ($request->has('is_available')) {
+            $data['is_available'] = $request->boolean('is_available');
+        }
 
-            'status' =>
-                $request->status ?? $foodItem->status,
+        if ($request->boolean('remove_image')) {
+            $this->deleteStoredImage($foodItem->image);
+            $data['image'] = null;
+        } elseif ($request->hasFile('image')) {
+            $newImagePath = $request->file('image')->store(
+                'food-items',
+                'public'
+            );
 
-            'is_available' => $request->has('is_available')
-                ? $request->boolean('is_available')
-                : $foodItem->is_available,
+            $this->deleteStoredImage($foodItem->image);
+            $data['image'] = $newImagePath;
+        }
 
-            'preparation_time_minutes' =>
-                $request->preparation_time_minutes,
+        $data['updated_by'] = $request->user()->id;
 
-            'sort_order' =>
-                $request->sort_order ??
-                $foodItem->sort_order,
-
-            'updated_by' => $request->user()->id,
-        ]);
-
-        $foodItem->load([
-            'category:id,name,slug,status',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        $foodItem->update($data);
+        $foodItem->load($this->defaultRelations());
 
         return $this->sendResponse(
             $this->prepareFoodItemResponse($foodItem),
@@ -426,41 +377,56 @@ class FoodItemController extends BaseController
     }
 
     /**
-     * Delete a food item.
-     *
-     * The image is not removed here because the food item can
-     * still be restored.
+     * Soft-delete a food item.
      */
-    public function destroy(FoodItem $foodItem): JsonResponse
-    {
+    public function destroy(
+        Request $request,
+        FoodItem $foodItem
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can delete food items.'
+            );
+        }
+
+        if (
+            $foodItem->inventoryStock &&
+            (
+                (int) $foodItem->inventoryStock->quantity > 0 ||
+                (int) $foodItem->inventoryStock->reserved_quantity > 0
+            )
+        ) {
+            return $this->sendError(
+                'This food item still has stock. Reduce the stock to zero before deleting it.',
+                [],
+                400
+            );
+        }
+
         $foodItem->delete();
 
-        return $this->sendResponse(
-            [],
-            'Food item deleted successfully.'
-        );
+        return $this->sendResponse([], 'Food item deleted successfully.');
     }
 
     /**
      * Restore a deleted food item.
      */
-    public function restore(int $id): JsonResponse
+    public function restore(Request $request, int $id): JsonResponse
     {
-        $foodItem = FoodItem::onlyTrashed()->find($id);
-
-        if (!$foodItem) {
-            return $this->sendNotFound(
-                'Deleted food item not found.'
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can restore food items.'
             );
         }
 
-        $foodItem->restore();
+        $foodItem = FoodItem::onlyTrashed()->find($id);
 
-        $foodItem->load([
-            'category:id,name,slug,status',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        if (!$foodItem) {
+            return $this->sendNotFound('Deleted food item not found.');
+        }
+
+        $foodItem->restore();
+        $foodItem->load($this->defaultRelations());
 
         return $this->sendResponse(
             $this->prepareFoodItemResponse($foodItem),
@@ -469,17 +435,20 @@ class FoodItemController extends BaseController
     }
 
     /**
-     * Change food item availability.
+     * Change manual food-item availability.
      */
     public function updateAvailability(
         Request $request,
         FoodItem $foodItem
     ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can change food availability.'
+            );
+        }
+
         $validator = Validator::make($request->all(), [
-            'is_available' => [
-                'required',
-                'boolean',
-            ],
+            'is_available' => ['required', 'boolean'],
         ]);
 
         if ($validator->fails()) {
@@ -490,17 +459,11 @@ class FoodItemController extends BaseController
         }
 
         $foodItem->update([
-            'is_available' =>
-                $request->boolean('is_available'),
-
+            'is_available' => $request->boolean('is_available'),
             'updated_by' => $request->user()->id,
         ]);
 
-        $foodItem->load([
-            'category:id,name,slug,status',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        $foodItem->load($this->defaultRelations());
 
         return $this->sendResponse(
             $this->prepareFoodItemResponse($foodItem),
@@ -509,7 +472,20 @@ class FoodItemController extends BaseController
     }
 
     /**
-     * Add the complete public image URL to the API response.
+     * Default API relations.
+     */
+    private function defaultRelations(): array
+    {
+        return [
+            'category:id,name,slug,status',
+            'inventoryStock:id,food_item_id,quantity,reserved_quantity,low_stock_quantity,status,location',
+            'createdBy:id,name,email,phone,role',
+            'updatedBy:id,name,email,phone,role',
+        ];
+    }
+
+    /**
+     * Add image and stock information to the response.
      */
     private function prepareFoodItemResponse(
         FoodItem $foodItem
@@ -517,42 +493,54 @@ class FoodItemController extends BaseController
         $imageUrl = null;
 
         if ($foodItem->image) {
-            if (
-                Str::startsWith(
-                    $foodItem->image,
-                    ['http://', 'https://']
-                )
-            ) {
+            if (Str::startsWith($foodItem->image, ['http://', 'https://'])) {
                 $imageUrl = $foodItem->image;
             } else {
                 $imageUrl = url(
-                    Storage::disk('public')->url(
-                        $foodItem->image
-                    )
+                    Storage::disk('public')->url($foodItem->image)
                 );
             }
         }
 
         $foodItem->setAttribute('image_url', $imageUrl);
+        $foodItem->setAttribute(
+            'available_quantity',
+            $this->availableQuantity($foodItem)
+        );
 
         return $foodItem;
     }
 
     /**
-     * Delete an old locally stored food image.
+     * Calculate sellable stock after reservations.
      */
-    private function deleteStoredImage(
-        ?string $imagePath
-    ): void {
-        if (!$imagePath) {
-            return;
+    private function availableQuantity(FoodItem $foodItem): int
+    {
+        if (!$foodItem->relationLoaded('inventoryStock')) {
+            $foodItem->load(
+                'inventoryStock:id,food_item_id,quantity,reserved_quantity,low_stock_quantity,status,location'
+            );
         }
 
+        if (!$foodItem->inventoryStock) {
+            return 0;
+        }
+
+        return max(
+            0,
+            (int) $foodItem->inventoryStock->quantity -
+            (int) $foodItem->inventoryStock->reserved_quantity
+        );
+    }
+
+    /**
+     * Delete an old locally stored food image.
+     */
+    private function deleteStoredImage(?string $imagePath): void
+    {
         if (
-            Str::startsWith(
-                $imagePath,
-                ['http://', 'https://']
-            )
+            !$imagePath ||
+            Str::startsWith($imagePath, ['http://', 'https://'])
         ) {
             return;
         }
@@ -563,29 +551,23 @@ class FoodItemController extends BaseController
     }
 
     /**
-     * Generate a unique slug.
+     * Generate a unique slug, including soft-deleted records.
      */
     private function generateUniqueSlug(
         string $name,
         ?int $ignoreId = null
     ): string {
-        $slug = Str::slug($name);
+        $baseSlug = Str::slug($name);
+        $slug = $baseSlug !== '' ? $baseSlug : 'food-item';
         $originalSlug = $slug;
         $counter = 1;
 
         while (
             FoodItem::withTrashed()
                 ->where('slug', $slug)
-                ->when(
-                    $ignoreId,
-                    function ($query) use ($ignoreId) {
-                        $query->where(
-                            'id',
-                            '!=',
-                            $ignoreId
-                        );
-                    }
-                )
+                ->when($ignoreId, function ($query) use ($ignoreId) {
+                    $query->where('id', '!=', $ignoreId);
+                })
                 ->exists()
         ) {
             $slug = $originalSlug . '-' . $counter;

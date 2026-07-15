@@ -2,20 +2,27 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Controllers\API\BaseController;
 use App\Models\FoodCategory;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
+use Illuminate\Validation\Rule;
 
 class FoodCategoryController extends BaseController
 {
     /**
-     * Display all food categories.
+     * Display food categories.
+     *
+     * Students only receive active, non-deleted categories.
+     * Admin/staff may filter status and include soft-deleted records.
      */
     public function index(Request $request): JsonResponse
     {
+        $authUser = $request->user();
+        $canManage = $authUser?->canManageInventory() ?? false;
+
         $query = FoodCategory::query()
             ->with([
                 'createdBy:id,name,email,phone,role',
@@ -24,22 +31,41 @@ class FoodCategoryController extends BaseController
             ->orderBy('sort_order')
             ->orderBy('name');
 
-        if ($request->filled('status')) {
-            $query->where('status', $request->status);
+        if ($canManage) {
+            if (
+                $request->boolean('with_trashed') ||
+                $request->boolean('include_deleted')
+            ) {
+                $query->withTrashed();
+            }
+
+            if ($request->filled('status')) {
+                $query->where('status', $request->status);
+            }
+        } else {
+            $query->where('status', FoodCategory::STATUS_ACTIVE);
         }
 
         if ($request->filled('search')) {
-            $query->where(function ($q) use ($request) {
-                $q->where('name', 'like', '%' . $request->search . '%')
-                  ->orWhere('description', 'like', '%' . $request->search . '%');
+            $search = trim((string) $request->search);
+
+            $query->where(function ($q) use ($search) {
+                $q->where('name', 'like', '%' . $search . '%')
+                    ->orWhere('description', 'like', '%' . $search . '%');
             });
         }
 
-        $perPage = $request->get('per_page', 20);
-
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
         $categories = $query->paginate($perPage);
 
-        return $this->sendResponse($categories, 'Food categories retrieved successfully.');
+        $categories->getCollection()->transform(
+            fn (FoodCategory $category) => $this->prepareCategoryResponse($category)
+        );
+
+        return $this->sendResponse(
+            $categories,
+            'Food categories retrieved successfully.'
+        );
     }
 
     /**
@@ -47,27 +73,63 @@ class FoodCategoryController extends BaseController
      */
     public function store(Request $request): JsonResponse
     {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can create food categories.'
+            );
+        }
+
         $validator = Validator::make($request->all(), [
-            'name'        => 'required|string|max:255|unique:food_categories,name',
-            'description' => 'nullable|string',
-            'image'       => 'nullable|string|max:255',
-            'status'      => 'nullable|in:active,inactive',
-            'sort_order'  => 'nullable|integer|min:0',
+            'name' => [
+                'required',
+                'string',
+                'max:255',
+                Rule::unique('food_categories', 'name'),
+            ],
+            'description' => ['nullable', 'string'],
+            'image' => [
+                'nullable',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:5120',
+            ],
+            'status' => [
+                'nullable',
+                Rule::in([
+                    FoodCategory::STATUS_ACTIVE,
+                    FoodCategory::STATUS_INACTIVE,
+                ]),
+            ],
+            'sort_order' => ['nullable', 'integer', 'min:0'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
+        $imagePath = null;
+
+        if ($request->hasFile('image')) {
+            $imagePath = $request->file('image')->store(
+                'food-categories',
+                'public'
+            );
+        }
+
+        $name = trim((string) $request->name);
+
         $category = FoodCategory::create([
-            'name'        => $request->name,
-            'slug'        => $this->generateUniqueSlug($request->name),
+            'name' => $name,
+            'slug' => $this->generateUniqueSlug($name),
             'description' => $request->description,
-            'image'       => $request->image,
-            'status'      => $request->status ?? FoodCategory::STATUS_ACTIVE,
-            'sort_order'  => $request->sort_order ?? 0,
-            'created_by'  => $request->user()->id,
-            'updated_by'  => $request->user()->id,
+            'image' => $imagePath,
+            'status' => $request->status ?? FoodCategory::STATUS_ACTIVE,
+            'sort_order' => $request->sort_order ?? 0,
+            'created_by' => $request->user()->id,
+            'updated_by' => $request->user()->id,
         ]);
 
         $category->load([
@@ -75,94 +137,258 @@ class FoodCategoryController extends BaseController
             'updatedBy:id,name,email,phone,role',
         ]);
 
-        return $this->sendCreated($category, 'Food category created successfully.');
+        return $this->sendCreated(
+            $this->prepareCategoryResponse($category),
+            'Food category created successfully.'
+        );
     }
 
     /**
      * Display one food category.
      */
-    public function show(FoodCategory $foodCategory): JsonResponse
-    {
+    public function show(
+        Request $request,
+        FoodCategory $foodCategory
+    ): JsonResponse {
+        if (
+            !($request->user()?->canManageInventory() ?? false) &&
+            $foodCategory->status !== FoodCategory::STATUS_ACTIVE
+        ) {
+            return $this->sendNotFound('Food category not found.');
+        }
+
         $foodCategory->load([
             'createdBy:id,name,email,phone,role',
             'updatedBy:id,name,email,phone,role',
         ]);
 
-        return $this->sendResponse($foodCategory, 'Food category retrieved successfully.');
+        return $this->sendResponse(
+            $this->prepareCategoryResponse($foodCategory),
+            'Food category retrieved successfully.'
+        );
     }
 
     /**
      * Update a food category.
+     *
+     * Supports PUT and PATCH without clearing omitted fields.
      */
-    public function update(Request $request, FoodCategory $foodCategory): JsonResponse
-    {
+    public function update(
+        Request $request,
+        FoodCategory $foodCategory
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can update food categories.'
+            );
+        }
+
         $validator = Validator::make($request->all(), [
-            'name'        => 'required|string|max:255|unique:food_categories,name,' . $foodCategory->id,
-            'description' => 'nullable|string',
-            'image'       => 'nullable|string|max:255',
-            'status'      => 'nullable|in:active,inactive',
-            'sort_order'  => 'nullable|integer|min:0',
+            'name' => [
+                'sometimes',
+                'required',
+                'string',
+                'max:255',
+                Rule::unique('food_categories', 'name')
+                    ->ignore($foodCategory->id),
+            ],
+            'description' => ['sometimes', 'nullable', 'string'],
+            'image' => [
+                'sometimes',
+                'nullable',
+                'image',
+                'mimes:jpg,jpeg,png,webp',
+                'max:5120',
+            ],
+            'remove_image' => ['sometimes', 'boolean'],
+            'status' => [
+                'sometimes',
+                'required',
+                Rule::in([
+                    FoodCategory::STATUS_ACTIVE,
+                    FoodCategory::STATUS_INACTIVE,
+                ]),
+            ],
+            'sort_order' => ['sometimes', 'required', 'integer', 'min:0'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
-        $foodCategory->update([
-            'name'        => $request->name,
-            'slug'        => $this->generateUniqueSlug($request->name, $foodCategory->id),
-            'description' => $request->description,
-            'image'       => $request->image,
-            'status'      => $request->status ?? $foodCategory->status,
-            'sort_order'  => $request->sort_order ?? $foodCategory->sort_order,
-            'updated_by'  => $request->user()->id,
-        ]);
+        $data = [];
+
+        if ($request->has('name')) {
+            $name = trim((string) $request->name);
+            $data['name'] = $name;
+            $data['slug'] = $this->generateUniqueSlug(
+                $name,
+                $foodCategory->id
+            );
+        }
+
+        if ($request->has('description')) {
+            $data['description'] = $request->description;
+        }
+
+        if ($request->has('status')) {
+            $data['status'] = $request->status;
+        }
+
+        if ($request->has('sort_order')) {
+            $data['sort_order'] = (int) $request->sort_order;
+        }
+
+        if ($request->boolean('remove_image')) {
+            $this->deleteStoredImage($foodCategory->image);
+            $data['image'] = null;
+        } elseif ($request->hasFile('image')) {
+            $newImagePath = $request->file('image')->store(
+                'food-categories',
+                'public'
+            );
+
+            $this->deleteStoredImage($foodCategory->image);
+            $data['image'] = $newImagePath;
+        }
+
+        $data['updated_by'] = $request->user()->id;
+
+        $foodCategory->update($data);
 
         $foodCategory->load([
             'createdBy:id,name,email,phone,role',
             'updatedBy:id,name,email,phone,role',
         ]);
 
-        return $this->sendResponse($foodCategory, 'Food category updated successfully.');
+        return $this->sendResponse(
+            $this->prepareCategoryResponse($foodCategory),
+            'Food category updated successfully.'
+        );
     }
 
     /**
-     * Delete a food category.
+     * Soft-delete a food category.
      */
-    public function destroy(FoodCategory $foodCategory): JsonResponse
-    {
+    public function destroy(
+        Request $request,
+        FoodCategory $foodCategory
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can delete food categories.'
+            );
+        }
+
+        if (
+            method_exists($foodCategory, 'foodItems') &&
+            $foodCategory->foodItems()->whereNull('deleted_at')->exists()
+        ) {
+            return $this->sendError(
+                'This category still contains food items. Move or delete the food items first.',
+                [],
+                400
+            );
+        }
+
         $foodCategory->delete();
 
-        return $this->sendResponse([], 'Food category deleted successfully.');
+        return $this->sendResponse(
+            [],
+            'Food category deleted successfully.'
+        );
     }
 
     /**
-     * Restore deleted food category.
+     * Restore a deleted food category.
      */
-    public function restore(int $id): JsonResponse
+    public function restore(Request $request, int $id): JsonResponse
     {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can restore food categories.'
+            );
+        }
+
         $category = FoodCategory::onlyTrashed()->find($id);
 
         if (!$category) {
-            return $this->sendNotFound('Deleted food category not found.');
+            return $this->sendNotFound(
+                'Deleted food category not found.'
+            );
         }
 
         $category->restore();
 
-        return $this->sendResponse($category, 'Food category restored successfully.');
+        $category->load([
+            'createdBy:id,name,email,phone,role',
+            'updatedBy:id,name,email,phone,role',
+        ]);
+
+        return $this->sendResponse(
+            $this->prepareCategoryResponse($category),
+            'Food category restored successfully.'
+        );
     }
 
     /**
-     * Generate unique slug.
+     * Add the public image URL to the category response.
      */
-    private function generateUniqueSlug(string $name, ?int $ignoreId = null): string
+    private function prepareCategoryResponse(
+        FoodCategory $category
+    ): FoodCategory {
+        $imageUrl = null;
+
+        if ($category->image) {
+            if (Str::startsWith($category->image, ['http://', 'https://'])) {
+                $imageUrl = $category->image;
+            } else {
+                $imageUrl = url(
+                    Storage::disk('public')->url($category->image)
+                );
+            }
+        }
+
+        $category->setAttribute('image_url', $imageUrl);
+
+        return $category;
+    }
+
+    /**
+     * Delete an old locally stored image.
+     */
+    private function deleteStoredImage(?string $imagePath): void
     {
-        $slug = Str::slug($name);
+        if (
+            !$imagePath ||
+            Str::startsWith($imagePath, ['http://', 'https://'])
+        ) {
+            return;
+        }
+
+        if (Storage::disk('public')->exists($imagePath)) {
+            Storage::disk('public')->delete($imagePath);
+        }
+    }
+
+    /**
+     * Generate a unique slug, including soft-deleted records.
+     */
+    private function generateUniqueSlug(
+        string $name,
+        ?int $ignoreId = null
+    ): string {
+        $baseSlug = Str::slug($name);
+        $slug = $baseSlug !== '' ? $baseSlug : 'category';
         $originalSlug = $slug;
         $counter = 1;
 
         while (
-            FoodCategory::where('slug', $slug)
+            FoodCategory::withTrashed()
+                ->where('slug', $slug)
                 ->when($ignoreId, function ($query) use ($ignoreId) {
                     $query->where('id', '!=', $ignoreId);
                 })

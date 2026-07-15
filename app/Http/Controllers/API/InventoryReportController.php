@@ -57,7 +57,7 @@ class InventoryReportController extends BaseController
             });
         }
 
-        $perPage = $request->get('per_page', 20);
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
 
         $reports = $query->paginate($perPage);
 
@@ -410,9 +410,20 @@ class InventoryReportController extends BaseController
 
         $inactiveFoodItems = FoodItem::where('status', FoodItem::STATUS_INACTIVE)->count();
 
-        $availableFoodItems = FoodItem::where('is_available', true)->count();
+        $availableFoodItems = FoodItem::query()
+            ->where('status', FoodItem::STATUS_ACTIVE)
+            ->where('is_available', true)
+            ->whereHas('category', function ($categoryQuery) {
+                $categoryQuery->where('status', 'active');
+            })
+            ->whereHas('inventoryStock', function ($stockQuery) {
+                $stockQuery
+                    ->where('status', InventoryStock::STATUS_ACTIVE)
+                    ->whereRaw('(quantity - COALESCE(reserved_quantity, 0)) > 0');
+            })
+            ->count();
 
-        $unavailableFoodItems = FoodItem::where('is_available', false)->count();
+        $unavailableFoodItems = max(0, $totalFoodItems - $availableFoodItems);
 
         $totalStockRecords = $stocks->count();
 
@@ -469,7 +480,7 @@ class InventoryReportController extends BaseController
                 'location' => $stock->location,
             ];
 
-            if ($quantity <= 0) {
+            if ($available <= 0) {
                 $outOfStockItems++;
 
                 $outOfStockList[] = [
@@ -477,10 +488,12 @@ class InventoryReportController extends BaseController
                     'food_name' => $stock->foodItem?->name,
                     'sku' => $stock->foodItem?->sku,
                     'quantity' => $quantity,
+                    'reserved_quantity' => $reserved,
+                    'available_quantity' => $available,
                     'threshold_quantity' => $threshold,
                     'location' => $stock->location,
                 ];
-            } elseif ($quantity <= $threshold) {
+            } elseif ($available <= $threshold) {
                 $lowStockItems++;
 
                 $lowStockList[] = [
@@ -488,6 +501,8 @@ class InventoryReportController extends BaseController
                     'food_name' => $stock->foodItem?->name,
                     'sku' => $stock->foodItem?->sku,
                     'quantity' => $quantity,
+                    'reserved_quantity' => $reserved,
+                    'available_quantity' => $available,
                     'threshold_quantity' => $threshold,
                     'location' => $stock->location,
                 ];
@@ -504,13 +519,19 @@ class InventoryReportController extends BaseController
 
         $salesQuantity = $this->sumMovementQuantity($movementQuery, StockMovement::TYPE_SALE, false);
 
-        $adjustmentQuantity = $this->sumMovementQuantity($movementQuery, StockMovement::TYPE_ADJUSTMENT, false);
+        $adjustmentQuantity = $this->sumAbsoluteMovementQuantity($movementQuery, StockMovement::TYPE_ADJUSTMENT);
 
         $damagedQuantity = $this->sumMovementQuantity($movementQuery, StockMovement::TYPE_DAMAGED, false);
 
         $expiredQuantity = $this->sumMovementQuantity($movementQuery, StockMovement::TYPE_EXPIRED, false);
 
         $returnQuantity = $this->sumMovementQuantity($movementQuery, StockMovement::TYPE_RETURN, true);
+
+        $initialStockQuantity = $this->sumMovementQuantity(
+            $movementQuery,
+            StockMovement::TYPE_INITIAL_STOCK,
+            true
+        );
 
         $movementsByType = (clone $movementQuery)
             ->select(
@@ -593,6 +614,10 @@ class InventoryReportController extends BaseController
             'return_quantity' => $returnQuantity,
 
             'report_data' => [
+                'snapshot_generated_at' => now()->toIso8601String(),
+                'movement_period_start' => $periodStart,
+                'movement_period_end' => $periodEnd,
+                'initial_stock_quantity' => $initialStockQuantity,
                 'low_stock_items' => $lowStockList,
                 'out_of_stock_items' => $outOfStockList,
                 'stock_values' => $stockValueList,
@@ -618,6 +643,20 @@ class InventoryReportController extends BaseController
         }
 
         return (int) abs($sum);
+    }
+
+    /**
+     * Sum the absolute quantity of every movement in a type.
+     *
+     * This preserves activity such as +10 and -10 adjustments instead of
+     * reporting a misleading net value of zero.
+     */
+    private function sumAbsoluteMovementQuantity($baseQuery, string $movementType): int
+    {
+        return (int) (clone $baseQuery)
+            ->where('movement_type', $movementType)
+            ->selectRaw('COALESCE(SUM(ABS(quantity_change)), 0) as total_quantity')
+            ->value('total_quantity');
     }
 
     /**
@@ -658,11 +697,11 @@ class InventoryReportController extends BaseController
      */
     private function getThresholdQuantity(InventoryStock $stock): int
     {
-        if ($stock->low_stock_quantity !== null && $stock->low_stock_quantity > 0) {
+        if ($stock->low_stock_quantity !== null && $stock->low_stock_quantity >= 0) {
             return (int) $stock->low_stock_quantity;
         }
 
-        if ($stock->foodItem && $stock->foodItem->low_stock_quantity > 0) {
+        if ($stock->foodItem && $stock->foodItem->low_stock_quantity !== null) {
             return (int) $stock->foodItem->low_stock_quantity;
         }
 

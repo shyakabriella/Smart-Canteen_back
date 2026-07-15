@@ -133,26 +133,21 @@ Route::middleware('auth:sanctum')->group(function () {
     |--------------------------------------------------------------------------
     */
 
-    Route::apiResource(
-        'food-categories',
-        FoodCategoryController::class
-    );
-
     Route::post(
         'food-categories/{id}/restore',
         [FoodCategoryController::class, 'restore']
     )->whereNumber('id');
+
+    Route::apiResource(
+        'food-categories',
+        FoodCategoryController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
     | Food Item Routes
     |--------------------------------------------------------------------------
     */
-
-    Route::apiResource(
-        'food-items',
-        FoodItemController::class
-    );
 
     Route::post(
         'food-items/{id}/restore',
@@ -163,6 +158,11 @@ Route::middleware('auth:sanctum')->group(function () {
         'food-items/{foodItem}/availability',
         [FoodItemController::class, 'updateAvailability']
     )->whereNumber('foodItem');
+
+    Route::apiResource(
+        'food-items',
+        FoodItemController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -246,11 +246,6 @@ Route::middleware('auth:sanctum')->group(function () {
         [InventoryStockController::class, 'lowStock']
     );
 
-    Route::apiResource(
-        'inventory-stocks',
-        InventoryStockController::class
-    );
-
     Route::post(
         'inventory-stocks/{id}/restore',
         [InventoryStockController::class, 'restore']
@@ -265,6 +260,11 @@ Route::middleware('auth:sanctum')->group(function () {
         'inventory-stocks/{inventoryStock}/reduce-stock',
         [InventoryStockController::class, 'reduceStock']
     )->whereNumber('inventoryStock');
+
+    Route::apiResource(
+        'inventory-stocks',
+        InventoryStockController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -355,10 +355,10 @@ Route::middleware('auth:sanctum')->group(function () {
         [OrderController::class, 'summary']
     );
 
-    Route::apiResource(
-        'orders',
-        OrderController::class
-    );
+    Route::post(
+        'orders/{id}/restore',
+        [OrderController::class, 'restore']
+    )->whereNumber('id');
 
     Route::post(
         'orders/{order}/preparing',
@@ -380,10 +380,10 @@ Route::middleware('auth:sanctum')->group(function () {
         [OrderController::class, 'cancel']
     )->whereNumber('order');
 
-    Route::post(
-        'orders/{id}/restore',
-        [OrderController::class, 'restore']
-    )->whereNumber('id');
+    Route::apiResource(
+        'orders',
+        OrderController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -414,10 +414,10 @@ Route::middleware('auth:sanctum')->group(function () {
         [OrderQrCodeController::class, 'verify']
     );
 
-    Route::apiResource(
-        'order-qr-codes',
-        OrderQrCodeController::class
-    );
+    Route::post(
+        'order-qr-codes/{id}/restore',
+        [OrderQrCodeController::class, 'restore']
+    )->whereNumber('id');
 
     Route::post(
         'order-qr-codes/{orderQrCode}/mark-used',
@@ -434,10 +434,10 @@ Route::middleware('auth:sanctum')->group(function () {
         [OrderQrCodeController::class, 'cancel']
     )->whereNumber('orderQrCode');
 
-    Route::post(
-        'order-qr-codes/{id}/restore',
-        [OrderQrCodeController::class, 'restore']
-    )->whereNumber('id');
+    Route::apiResource(
+        'order-qr-codes',
+        OrderQrCodeController::class
+    );
 
     /*
     |--------------------------------------------------------------------------
@@ -450,19 +450,17 @@ Route::middleware('auth:sanctum')->group(function () {
         [QrScanLogController::class, 'summary']
     );
 
+    /*
+     * QR scan logs are immutable audit records.
+     * They can be listed and viewed, but not deleted or restored.
+     */
     Route::apiResource(
         'qr-scan-logs',
         QrScanLogController::class
     )->only([
         'index',
         'show',
-        'destroy',
     ]);
-
-    Route::post(
-        'qr-scan-logs/{id}/restore',
-        [QrScanLogController::class, 'restore']
-    )->whereNumber('id');
 
     /*
     |--------------------------------------------------------------------------

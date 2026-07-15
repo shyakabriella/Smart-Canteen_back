@@ -2,11 +2,12 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Http\Controllers\API\BaseController;
+use App\Models\Order;
 use App\Models\OrderItem;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Validation\Rule;
 
 class OrderItemController extends BaseController
 {
@@ -18,13 +19,7 @@ class OrderItemController extends BaseController
         $authUser = $request->user();
 
         $query = OrderItem::query()
-            ->with([
-                'order:id,user_id,order_number,total_amount,payment_status,order_status,pickup_status',
-                'order.user:id,name,email,phone,role',
-                'foodItem:id,name,sku,price,unit',
-                'createdBy:id,name,email,phone,role',
-                'updatedBy:id,name,email,phone,role',
-            ])
+            ->with($this->defaultRelations())
             ->orderByDesc('id');
 
         if (!$authUser->canManageOrders()) {
@@ -46,119 +41,224 @@ class OrderItemController extends BaseController
         }
 
         if ($request->filled('search')) {
-            $query->where(function ($q) use ($request) {
-                $q->where('food_name', 'like', '%' . $request->search . '%')
-                    ->orWhere('food_sku', 'like', '%' . $request->search . '%')
-                    ->orWhereHas('order', function ($orderQuery) use ($request) {
-                        $orderQuery->where('order_number', 'like', '%' . $request->search . '%');
+            $search = trim((string) $request->search);
+
+            $query->where(function ($q) use ($search) {
+                $q->where('food_name', 'like', '%' . $search . '%')
+                    ->orWhere('food_sku', 'like', '%' . $search . '%')
+                    ->orWhereHas('order', function ($orderQuery) use ($search) {
+                        $orderQuery->where(
+                            'order_number',
+                            'like',
+                            '%' . $search . '%'
+                        );
                     });
             });
         }
 
-        $perPage = $request->get('per_page', 20);
-
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
         $items = $query->paginate($perPage);
 
-        return $this->sendResponse($items, 'Order items retrieved successfully.');
+        return $this->sendResponse(
+            $items,
+            'Order items retrieved successfully.'
+        );
     }
 
     /**
      * Display one order item.
      */
-    public function show(Request $request, OrderItem $orderItem): JsonResponse
-    {
+    public function show(
+        Request $request,
+        OrderItem $orderItem
+    ): JsonResponse {
         $authUser = $request->user();
 
         $orderItem->load('order');
 
-        if (!$authUser->canManageOrders() && $orderItem->order->user_id !== $authUser->id) {
-            return $this->sendForbidden('You can only view your own order items.');
+        if (
+            !$authUser->canManageOrders() &&
+            $orderItem->order->user_id !== $authUser->id
+        ) {
+            return $this->sendForbidden(
+                'You can only view your own order items.'
+            );
         }
 
-        $orderItem->load([
-            'order:id,user_id,order_number,total_amount,payment_status,order_status,pickup_status',
-            'order.user:id,name,email,phone,role',
-            'foodItem:id,name,sku,price,unit',
-            'createdBy:id,name,email,phone,role',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        $orderItem->load($this->defaultRelations());
 
-        return $this->sendResponse($orderItem, 'Order item retrieved successfully.');
+        return $this->sendResponse(
+            $orderItem,
+            'Order item retrieved successfully.'
+        );
     }
 
     /**
-     * Update order item notes/status.
+     * Update order-item notes and synchronized status.
      *
-     * Quantity and price are not updated here because they affect payment and stock.
+     * Quantity and prices are intentionally immutable because they affect
+     * payment, wallet balance, stock, and financial history.
      */
-    public function update(Request $request, OrderItem $orderItem): JsonResponse
-    {
+    public function update(
+        Request $request,
+        OrderItem $orderItem
+    ): JsonResponse {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can update order items.');
+            return $this->sendForbidden(
+                'Only admin or staff can update order items.'
+            );
         }
 
         $validator = Validator::make($request->all(), [
-            'item_status' => 'nullable|in:pending,confirmed,prepared,collected,cancelled',
-            'notes' => 'nullable|string',
+            'item_status' => [
+                'sometimes',
+                'required',
+                Rule::in([
+                    'pending',
+                    'confirmed',
+                    'prepared',
+                    'collected',
+                    'cancelled',
+                ]),
+            ],
+            'notes' => ['sometimes', 'nullable', 'string'],
         ]);
 
         if ($validator->fails()) {
-            return $this->sendValidationError($validator->errors(), 'Please check your input.');
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
-        $orderItem->update([
-            'item_status' => $request->item_status ?? $orderItem->item_status,
-            'notes' => $request->notes ?? $orderItem->notes,
-            'updated_by' => $request->user()->id,
-        ]);
+        $orderItem->load('order');
 
-        $orderItem->load([
-            'order:id,user_id,order_number,total_amount,payment_status,order_status,pickup_status',
-            'foodItem:id,name,sku,price,unit',
-            'updatedBy:id,name,email,phone,role',
-        ]);
+        if ($request->has('item_status')) {
+            $statusError = $this->validateStatusAgainstOrder(
+                $orderItem->order,
+                (string) $request->item_status
+            );
 
-        return $this->sendResponse($orderItem, 'Order item updated successfully.');
+            if ($statusError !== null) {
+                return $this->sendError($statusError, [], 400);
+            }
+        }
+
+        $data = ['updated_by' => $request->user()->id];
+
+        if ($request->has('item_status')) {
+            $data['item_status'] = $request->item_status;
+        }
+
+        if ($request->has('notes')) {
+            $data['notes'] = $request->notes;
+        }
+
+        $orderItem->update($data);
+        $orderItem->load($this->defaultRelations());
+
+        return $this->sendResponse(
+            $orderItem,
+            'Order item updated successfully.'
+        );
     }
 
     /**
-     * Delete order item history.
+     * Delete an order item only after its parent order is cancelled.
      *
-     * This does not return stock. Use order cancellation for stock return.
+     * Active order items are retained to protect payment and stock history.
      */
-    public function destroy(Request $request, OrderItem $orderItem): JsonResponse
-    {
+    public function destroy(
+        Request $request,
+        OrderItem $orderItem
+    ): JsonResponse {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can delete order items.');
+            return $this->sendForbidden(
+                'Only admin or staff can delete order items.'
+            );
+        }
+
+        $orderItem->load('order');
+
+        if (!$orderItem->order->isCancelled()) {
+            return $this->sendError(
+                'Cancel the parent order before deleting an order item.',
+                [],
+                400
+            );
         }
 
         $orderItem->delete();
 
-        return $this->sendResponse([], 'Order item deleted successfully.');
+        return $this->sendResponse(
+            [],
+            'Order item deleted successfully.'
+        );
     }
 
     /**
-     * Restore deleted order item.
+     * Restore a deleted order item.
      */
     public function restore(Request $request, int $id): JsonResponse
     {
         if (!$request->user()->canManageOrders()) {
-            return $this->sendForbidden('Only admin or staff can restore order items.');
+            return $this->sendForbidden(
+                'Only admin or staff can restore order items.'
+            );
         }
 
         $item = OrderItem::onlyTrashed()->find($id);
 
         if (!$item) {
-            return $this->sendNotFound('Deleted order item not found.');
+            return $this->sendNotFound(
+                'Deleted order item not found.'
+            );
         }
 
         $item->restore();
+        $item->load($this->defaultRelations());
 
-        $item->load([
+        return $this->sendResponse(
+            $item,
+            'Order item restored successfully.'
+        );
+    }
+
+    /**
+     * Ensure an item status agrees with its parent order status.
+     */
+    private function validateStatusAgainstOrder(
+        Order $order,
+        string $itemStatus
+    ): ?string {
+        $allowedStatuses = match ($order->order_status) {
+            Order::STATUS_CONFIRMED,
+            Order::STATUS_PREPARING => ['pending', 'confirmed'],
+
+            Order::STATUS_READY => ['prepared'],
+            Order::STATUS_COMPLETED => ['collected'],
+            Order::STATUS_CANCELLED => ['cancelled'],
+            default => [],
+        };
+
+        if (!in_array($itemStatus, $allowedStatuses, true)) {
+            return 'The item status does not match the parent order status.';
+        }
+
+        return null;
+    }
+
+    /**
+     * Default order-item relations.
+     */
+    private function defaultRelations(): array
+    {
+        return [
             'order:id,user_id,order_number,total_amount,payment_status,order_status,pickup_status',
+            'order.user:id,name,email,phone,role',
             'foodItem:id,name,sku,price,unit',
-        ]);
-
-        return $this->sendResponse($item, 'Order item restored successfully.');
+            'createdBy:id,name,email,phone,role',
+            'updatedBy:id,name,email,phone,role',
+        ];
     }
 }
