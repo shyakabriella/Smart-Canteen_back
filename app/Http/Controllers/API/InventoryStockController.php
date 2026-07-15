@@ -2,98 +2,218 @@
 
 namespace App\Http\Controllers\API;
 
+use App\Models\FoodItem;
 use App\Models\InventoryStock;
 use App\Models\LowStockAlert;
+use App\Models\StockMovement;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Support\Str;
 
-class LowStockAlertController extends BaseController
+class InventoryStockController extends BaseController
 {
     /**
-     * Display low-stock alerts.
+     * Display inventory stock records.
      */
     public function index(Request $request): JsonResponse
     {
         if (!$request->user()->canManageInventory()) {
             return $this->sendForbidden(
-                'Only admin or staff can view low stock alerts.'
+                'Only admin or staff can view inventory stock.'
             );
         }
 
-        $query = LowStockAlert::query()
+        $query = InventoryStock::query()
             ->with($this->defaultRelations())
-            ->orderByRaw("\n                CASE severity\n                    WHEN 'critical' THEN 1\n                    WHEN 'high' THEN 2\n                    WHEN 'medium' THEN 3\n                    WHEN 'low' THEN 4\n                    ELSE 5\n                END\n            ")
             ->orderByDesc('id');
 
-        foreach ([
-            'food_item_id',
-            'inventory_stock_id',
-            'alert_type',
-            'severity',
-            'status',
-        ] as $field) {
-            if ($request->filled($field)) {
-                $query->where($field, $request->input($field));
-            }
+        if ($request->filled('food_item_id')) {
+            $query->where('food_item_id', $request->food_item_id);
         }
 
-        if ($request->filled('from_date')) {
-            $query->whereDate('created_at', '>=', $request->from_date);
+        if ($request->filled('status')) {
+            $query->where('status', $request->status);
         }
 
-        if ($request->filled('to_date')) {
-            $query->whereDate('created_at', '<=', $request->to_date);
+        if ($request->boolean('low_stock')) {
+            $query->whereRaw(
+                '(quantity - COALESCE(reserved_quantity, 0)) <= low_stock_quantity'
+            );
         }
 
         if ($request->filled('search')) {
             $search = trim((string) $request->search);
 
-            $query->where(function ($q) use ($search) {
-                $q->where('alert_number', 'like', '%' . $search . '%')
-                    ->orWhere('message', 'like', '%' . $search . '%')
-                    ->orWhereHas('foodItem', function ($foodQuery) use ($search) {
-                        $foodQuery
-                            ->where('name', 'like', '%' . $search . '%')
-                            ->orWhere('sku', 'like', '%' . $search . '%');
-                    });
+            $query->whereHas('foodItem', function ($q) use ($search) {
+                $q->where('name', 'like', '%' . $search . '%')
+                    ->orWhere('sku', 'like', '%' . $search . '%');
             });
         }
 
         $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
-        $alerts = $query->paginate($perPage);
+        $stocks = $query->paginate($perPage);
+
+        $stocks->getCollection()->transform(
+            fn (InventoryStock $stock) => $this->prepareStockResponse($stock)
+        );
 
         return $this->sendResponse(
-            $alerts,
-            'Low stock alerts retrieved successfully.'
+            $stocks,
+            'Inventory stocks retrieved successfully.'
         );
     }
 
     /**
-     * Store a manual low-stock alert.
+     * Store a new inventory stock record.
      */
     public function store(Request $request): JsonResponse
     {
         if (!$request->user()->canManageInventory()) {
             return $this->sendForbidden(
-                'Only admin or staff can create low stock alerts.'
+                'Only admin or staff can manage inventory stock.'
             );
         }
 
         $validator = Validator::make($request->all(), [
-            'inventory_stock_id' => [
+            'food_item_id' => [
                 'required',
                 'integer',
-                'exists:inventory_stocks,id',
+                'exists:food_items,id',
+                'unique:inventory_stocks,food_item_id',
             ],
-            'alert_type' => [
-                'nullable',
-                'in:low_stock,out_of_stock,restock_required',
-            ],
-            'severity' => ['nullable', 'in:low,medium,high,critical'],
-            'message' => ['nullable', 'string', 'max:255'],
+            'quantity' => ['required', 'integer', 'min:0'],
+            'reserved_quantity' => ['nullable', 'integer', 'min:0'],
+            'low_stock_quantity' => ['nullable', 'integer', 'min:0'],
+            'location' => ['nullable', 'string', 'max:255'],
+            'status' => ['nullable', 'in:active,inactive'],
+            'reason' => ['nullable', 'string', 'max:255'],
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        $validator->after(function ($validator) use ($request) {
+            $quantity = (int) $request->input('quantity', 0);
+            $reserved = (int) $request->input('reserved_quantity', 0);
+
+            if ($reserved > $quantity) {
+                $validator->errors()->add(
+                    'reserved_quantity',
+                    'Reserved quantity cannot exceed total quantity.'
+                );
+            }
+        });
+
+        if ($validator->fails()) {
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
+        }
+
+        try {
+            $stock = DB::transaction(function () use ($request) {
+                $foodItem = FoodItem::query()
+                    ->lockForUpdate()
+                    ->findOrFail($request->food_item_id);
+
+                $threshold = $request->has('low_stock_quantity')
+                    ? (int) $request->low_stock_quantity
+                    : (int) ($foodItem->low_stock_quantity ?? 5);
+
+                $stock = InventoryStock::create([
+                    'food_item_id' => $foodItem->id,
+                    'quantity' => (int) $request->quantity,
+                    'reserved_quantity' => (int) ($request->reserved_quantity ?? 0),
+                    'low_stock_quantity' => $threshold,
+                    'location' => $request->location,
+                    'status' => $request->status ?? InventoryStock::STATUS_ACTIVE,
+                    'last_restocked_at' => (int) $request->quantity > 0
+                        ? now()
+                        : null,
+                    'created_by' => $request->user()->id,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                if ((int) $request->quantity > 0) {
+                    StockMovement::create([
+                        'inventory_stock_id' => $stock->id,
+                        'food_item_id' => $stock->food_item_id,
+                        'movement_type' => StockMovement::TYPE_INITIAL_STOCK,
+                        'quantity_before' => 0,
+                        'quantity_change' => (int) $request->quantity,
+                        'quantity_after' => (int) $request->quantity,
+                        'reason' => $request->reason ?? 'Initial stock created',
+                        'notes' => $request->notes,
+                        'movement_date' => now(),
+                        'created_by' => $request->user()->id,
+                        'updated_by' => $request->user()->id,
+                    ]);
+                }
+
+                $stock->load('foodItem');
+                $this->syncLowStockAlert($stock, $request->user()->id);
+
+                return $stock;
+            });
+        } catch (\Throwable $e) {
+            return $this->sendError($e->getMessage(), [], 400);
+        }
+
+        $stock->load($this->defaultRelations());
+
+        return $this->sendCreated(
+            $this->prepareStockResponse($stock),
+            'Inventory stock created successfully.'
+        );
+    }
+
+    /**
+     * Display one inventory stock record.
+     */
+    public function show(
+        Request $request,
+        InventoryStock $inventoryStock
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can view inventory stock.'
+            );
+        }
+
+        $inventoryStock->load(array_merge(
+            $this->defaultRelations(),
+            ['stockMovements']
+        ));
+
+        return $this->sendResponse(
+            $this->prepareStockResponse($inventoryStock),
+            'Inventory stock retrieved successfully.'
+        );
+    }
+
+    /**
+     * Update an inventory stock record.
+     *
+     * Supports PATCH and locks the stock row before calculating changes.
+     */
+    public function update(
+        Request $request,
+        InventoryStock $inventoryStock
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can update inventory stock.'
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'quantity' => ['sometimes', 'required', 'integer', 'min:0'],
+            'reserved_quantity' => ['sometimes', 'required', 'integer', 'min:0'],
+            'low_stock_quantity' => ['sometimes', 'required', 'integer', 'min:0'],
+            'location' => ['sometimes', 'nullable', 'string', 'max:255'],
+            'status' => ['sometimes', 'required', 'in:active,inactive'],
+            'reason' => ['nullable', 'string', 'max:255'],
             'notes' => ['nullable', 'string'],
         ]);
 
@@ -105,508 +225,381 @@ class LowStockAlertController extends BaseController
         }
 
         try {
-            $alert = DB::transaction(function () use ($request) {
-                $stock = InventoryStock::with('foodItem')
-                    ->whereKey($request->inventory_stock_id)
+            $inventoryStock = DB::transaction(function () use ($request, $inventoryStock) {
+                $stock = InventoryStock::query()
+                    ->whereKey($inventoryStock->id)
                     ->lockForUpdate()
                     ->firstOrFail();
 
-                $activeExists = LowStockAlert::query()
-                    ->where('inventory_stock_id', $stock->id)
-                    ->where('status', LowStockAlert::STATUS_ACTIVE)
-                    ->exists();
+                $oldQuantity = (int) $stock->quantity;
+                $newQuantity = $request->has('quantity')
+                    ? (int) $request->quantity
+                    : $oldQuantity;
 
-                if ($activeExists) {
+                $newReserved = $request->has('reserved_quantity')
+                    ? (int) $request->reserved_quantity
+                    : (int) $stock->reserved_quantity;
+
+                if ($newReserved > $newQuantity) {
                     throw new \RuntimeException(
-                        'There is already an active alert for this stock item.'
+                        'Reserved quantity cannot exceed total quantity.'
                     );
                 }
 
-                $available = $this->availableQuantity($stock);
-                $threshold = $this->getThresholdQuantity($stock);
+                $quantityChange = $newQuantity - $oldQuantity;
 
-                if ($available > $threshold) {
-                    throw new \RuntimeException(
-                        'Available stock is above the low-stock threshold. No alert is required.'
-                    );
-                }
-
-                $alertType = $request->alert_type
-                    ?? $this->determineAlertType($available);
-
-                $severity = $request->severity
-                    ?? $this->determineSeverity($available, $threshold);
-
-                return LowStockAlert::create([
-                    'inventory_stock_id' => $stock->id,
-                    'food_item_id' => $stock->food_item_id,
-                    'alert_number' => $this->generateAlertNumber(),
-                    'alert_type' => $alertType,
-                    'severity' => $severity,
-                    'current_quantity' => $available,
-                    'threshold_quantity' => $threshold,
-                    'status' => LowStockAlert::STATUS_ACTIVE,
-                    'message' => $request->message
-                        ?? $this->buildAlertMessage(
-                            $stock,
-                            $alertType,
-                            $available,
-                            $threshold
-                        ),
-                    'notes' => $request->notes,
-                    'created_by' => $request->user()->id,
+                $data = [
+                    'quantity' => $newQuantity,
+                    'reserved_quantity' => $newReserved,
                     'updated_by' => $request->user()->id,
-                ]);
+                ];
+
+                foreach ([
+                    'low_stock_quantity',
+                    'location',
+                    'status',
+                ] as $field) {
+                    if ($request->has($field)) {
+                        $data[$field] = $request->input($field);
+                    }
+                }
+
+                if ($quantityChange > 0) {
+                    $data['last_restocked_at'] = now();
+                }
+
+                $stock->update($data);
+
+                if ($quantityChange !== 0) {
+                    StockMovement::create([
+                        'inventory_stock_id' => $stock->id,
+                        'food_item_id' => $stock->food_item_id,
+                        'movement_type' => StockMovement::TYPE_ADJUSTMENT,
+                        'quantity_before' => $oldQuantity,
+                        'quantity_change' => $quantityChange,
+                        'quantity_after' => $newQuantity,
+                        'reason' => $request->reason ?? 'Manual stock adjustment',
+                        'notes' => $request->notes,
+                        'movement_date' => now(),
+                        'created_by' => $request->user()->id,
+                        'updated_by' => $request->user()->id,
+                    ]);
+                }
+
+                $stock->load('foodItem');
+                $this->syncLowStockAlert($stock, $request->user()->id);
+
+                return $stock;
             });
         } catch (\Throwable $e) {
             return $this->sendError($e->getMessage(), [], 400);
         }
 
-        $alert->load($this->defaultRelations());
-
-        return $this->sendCreated(
-            $alert,
-            'Low stock alert created successfully.'
-        );
-    }
-
-    /**
-     * Generate, refresh, and optionally auto-resolve alerts from stock.
-     */
-    public function generate(Request $request): JsonResponse
-    {
-        if (!$request->user()->canManageInventory()) {
-            return $this->sendForbidden(
-                'Only admin or staff can generate low stock alerts.'
-            );
-        }
-
-        $validator = Validator::make($request->all(), [
-            'auto_resolve' => ['nullable', 'boolean'],
-        ]);
-
-        if ($validator->fails()) {
-            return $this->sendValidationError(
-                $validator->errors(),
-                'Please check your input.'
-            );
-        }
-
-        $autoResolve = $request->boolean('auto_resolve', true);
-
-        $result = DB::transaction(function () use ($request, $autoResolve) {
-            $created = 0;
-            $updated = 0;
-            $resolved = 0;
-
-            $stocks = InventoryStock::with('foodItem')
-                ->where('status', InventoryStock::STATUS_ACTIVE)
-                ->lockForUpdate()
-                ->get();
-
-            foreach ($stocks as $stock) {
-                $available = $this->availableQuantity($stock);
-                $threshold = $this->getThresholdQuantity($stock);
-
-                $existingAlert = LowStockAlert::query()
-                    ->where('inventory_stock_id', $stock->id)
-                    ->where('status', LowStockAlert::STATUS_ACTIVE)
-                    ->lockForUpdate()
-                    ->first();
-
-                if ($available <= $threshold) {
-                    $alertType = $this->determineAlertType($available);
-                    $severity = $this->determineSeverity(
-                        $available,
-                        $threshold
-                    );
-
-                    $data = [
-                        'alert_type' => $alertType,
-                        'severity' => $severity,
-                        'current_quantity' => $available,
-                        'threshold_quantity' => $threshold,
-                        'message' => $this->buildAlertMessage(
-                            $stock,
-                            $alertType,
-                            $available,
-                            $threshold
-                        ),
-                        'updated_by' => $request->user()->id,
-                    ];
-
-                    if ($existingAlert) {
-                        $existingAlert->update($data);
-                        $updated++;
-                    } else {
-                        LowStockAlert::create(array_merge($data, [
-                            'inventory_stock_id' => $stock->id,
-                            'food_item_id' => $stock->food_item_id,
-                            'alert_number' => $this->generateAlertNumber(),
-                            'status' => LowStockAlert::STATUS_ACTIVE,
-                            'notes' => 'Generated automatically from available inventory stock.',
-                            'created_by' => $request->user()->id,
-                        ]));
-
-                        $created++;
-                    }
-                } elseif ($autoResolve && $existingAlert) {
-                    $existingAlert->update([
-                        'status' => LowStockAlert::STATUS_RESOLVED,
-                        'resolved_by' => $request->user()->id,
-                        'resolved_at' => now(),
-                        'resolution_notes' => 'Auto-resolved because available stock is now above the threshold.',
-                        'updated_by' => $request->user()->id,
-                    ]);
-
-                    $resolved++;
-                }
-            }
-
-            if ($autoResolve) {
-                $orphanedOrInactiveAlerts = LowStockAlert::with('inventoryStock')
-                    ->where('status', LowStockAlert::STATUS_ACTIVE)
-                    ->get();
-
-                foreach ($orphanedOrInactiveAlerts as $alert) {
-                    if (
-                        !$alert->inventoryStock ||
-                        $alert->inventoryStock->status !== InventoryStock::STATUS_ACTIVE
-                    ) {
-                        $alert->update([
-                            'status' => LowStockAlert::STATUS_RESOLVED,
-                            'resolved_by' => $request->user()->id,
-                            'resolved_at' => now(),
-                            'resolution_notes' => 'Auto-resolved because the stock record is missing or inactive.',
-                            'updated_by' => $request->user()->id,
-                        ]);
-
-                        $resolved++;
-                    }
-                }
-            }
-
-            return [
-                'created_alerts' => $created,
-                'updated_alerts' => $updated,
-                'resolved_alerts' => $resolved,
-            ];
-        });
+        $inventoryStock->load($this->defaultRelations());
 
         return $this->sendResponse(
-            $result,
-            'Low stock alert generation completed successfully.'
+            $this->prepareStockResponse($inventoryStock),
+            'Inventory stock updated successfully.'
         );
     }
 
     /**
-     * Display one low-stock alert.
-     */
-    public function show(
-        Request $request,
-        LowStockAlert $lowStockAlert
-    ): JsonResponse {
-        if (!$request->user()->canManageInventory()) {
-            return $this->sendForbidden(
-                'Only admin or staff can view low stock alerts.'
-            );
-        }
-
-        $lowStockAlert->load($this->defaultRelations());
-
-        return $this->sendResponse(
-            $lowStockAlert,
-            'Low stock alert retrieved successfully.'
-        );
-    }
-
-    /**
-     * Update an active alert.
-     */
-    public function update(
-        Request $request,
-        LowStockAlert $lowStockAlert
-    ): JsonResponse {
-        if (!$request->user()->canManageInventory()) {
-            return $this->sendForbidden(
-                'Only admin or staff can update low stock alerts.'
-            );
-        }
-
-        if (!$lowStockAlert->isActive()) {
-            return $this->sendError(
-                'Only active alerts can be updated.',
-                [],
-                400
-            );
-        }
-
-        $validator = Validator::make($request->all(), [
-            'severity' => [
-                'sometimes',
-                'required',
-                'in:low,medium,high,critical',
-            ],
-            'message' => ['sometimes', 'nullable', 'string', 'max:255'],
-            'notes' => ['sometimes', 'nullable', 'string'],
-        ]);
-
-        if ($validator->fails()) {
-            return $this->sendValidationError(
-                $validator->errors(),
-                'Please check your input.'
-            );
-        }
-
-        $data = ['updated_by' => $request->user()->id];
-
-        foreach (['severity', 'message', 'notes'] as $field) {
-            if ($request->has($field)) {
-                $data[$field] = $request->input($field);
-            }
-        }
-
-        $lowStockAlert->update($data);
-        $lowStockAlert->load($this->defaultRelations());
-
-        return $this->sendResponse(
-            $lowStockAlert,
-            'Low stock alert updated successfully.'
-        );
-    }
-
-    /**
-     * Resolve a low-stock alert.
-     */
-    public function resolve(
-        Request $request,
-        LowStockAlert $lowStockAlert
-    ): JsonResponse {
-        if (!$request->user()->canManageInventory()) {
-            return $this->sendForbidden(
-                'Only admin or staff can resolve low stock alerts.'
-            );
-        }
-
-        if (!$lowStockAlert->isActive()) {
-            return $this->sendError(
-                'Only active alerts can be resolved.',
-                [],
-                400
-            );
-        }
-
-        $validator = Validator::make($request->all(), [
-            'resolution_notes' => ['nullable', 'string'],
-        ]);
-
-        if ($validator->fails()) {
-            return $this->sendValidationError(
-                $validator->errors(),
-                'Please check your input.'
-            );
-        }
-
-        $lowStockAlert->update([
-            'status' => LowStockAlert::STATUS_RESOLVED,
-            'resolved_by' => $request->user()->id,
-            'resolved_at' => now(),
-            'resolution_notes' => $request->resolution_notes,
-            'updated_by' => $request->user()->id,
-        ]);
-
-        $lowStockAlert->load($this->defaultRelations());
-
-        return $this->sendResponse(
-            $lowStockAlert,
-            'Low stock alert resolved successfully.'
-        );
-    }
-
-    /**
-     * Dismiss a low-stock alert.
-     */
-    public function dismiss(
-        Request $request,
-        LowStockAlert $lowStockAlert
-    ): JsonResponse {
-        if (!$request->user()->canManageInventory()) {
-            return $this->sendForbidden(
-                'Only admin or staff can dismiss low stock alerts.'
-            );
-        }
-
-        if (!$lowStockAlert->isActive()) {
-            return $this->sendError(
-                'Only active alerts can be dismissed.',
-                [],
-                400
-            );
-        }
-
-        $validator = Validator::make($request->all(), [
-            'notes' => ['nullable', 'string'],
-        ]);
-
-        if ($validator->fails()) {
-            return $this->sendValidationError(
-                $validator->errors(),
-                'Please check your input.'
-            );
-        }
-
-        $lowStockAlert->update([
-            'status' => LowStockAlert::STATUS_DISMISSED,
-            'dismissed_by' => $request->user()->id,
-            'dismissed_at' => now(),
-            'notes' => $request->notes ?? $lowStockAlert->notes,
-            'updated_by' => $request->user()->id,
-        ]);
-
-        $lowStockAlert->load($this->defaultRelations());
-
-        return $this->sendResponse(
-            $lowStockAlert,
-            'Low stock alert dismissed successfully.'
-        );
-    }
-
-    /**
-     * Delete a non-active alert.
+     * Delete an empty inventory stock record.
      */
     public function destroy(
         Request $request,
-        LowStockAlert $lowStockAlert
+        InventoryStock $inventoryStock
     ): JsonResponse {
         if (!$request->user()->canManageInventory()) {
             return $this->sendForbidden(
-                'Only admin or staff can delete low stock alerts.'
+                'Only admin or staff can delete inventory stock.'
             );
         }
 
-        if ($lowStockAlert->isActive()) {
+        if (
+            (int) $inventoryStock->quantity > 0 ||
+            (int) $inventoryStock->reserved_quantity > 0
+        ) {
             return $this->sendError(
-                'Resolve or dismiss the alert before deleting it.',
+                'Only an empty stock record can be deleted.',
                 [],
                 400
             );
         }
 
-        $lowStockAlert->delete();
+        $inventoryStock->delete();
 
         return $this->sendResponse(
             [],
-            'Low stock alert deleted successfully.'
+            'Inventory stock deleted successfully.'
         );
     }
 
     /**
-     * Restore a deleted alert.
+     * Restore deleted inventory stock.
      */
     public function restore(Request $request, int $id): JsonResponse
     {
         if (!$request->user()->canManageInventory()) {
             return $this->sendForbidden(
-                'Only admin or staff can restore low stock alerts.'
+                'Only admin or staff can restore inventory stock.'
             );
         }
 
-        $alert = LowStockAlert::onlyTrashed()->find($id);
+        $stock = InventoryStock::onlyTrashed()->find($id);
 
-        if (!$alert) {
+        if (!$stock) {
             return $this->sendNotFound(
-                'Deleted low stock alert not found.'
+                'Deleted inventory stock not found.'
             );
         }
 
-        $alert->restore();
-        $alert->load($this->defaultRelations());
+        $stock->restore();
+        $stock->load('foodItem');
+        $this->syncLowStockAlert($stock, $request->user()->id);
+        $stock->load($this->defaultRelations());
 
         return $this->sendResponse(
-            $alert,
-            'Low stock alert restored successfully.'
+            $this->prepareStockResponse($stock),
+            'Inventory stock restored successfully.'
         );
     }
 
     /**
-     * Low-stock alert summary.
+     * Add stock quantity.
      */
-    public function summary(Request $request): JsonResponse
-    {
+    public function addStock(
+        Request $request,
+        InventoryStock $inventoryStock
+    ): JsonResponse {
         if (!$request->user()->canManageInventory()) {
             return $this->sendForbidden(
-                'Only admin or staff can view low stock alert summary.'
+                'Only admin or staff can add stock.'
             );
         }
 
-        $query = LowStockAlert::query();
+        $validator = Validator::make($request->all(), [
+            'quantity' => ['required', 'integer', 'min:1'],
+            'unit_cost' => ['nullable', 'numeric', 'min:0'],
+            'reason' => ['nullable', 'string', 'max:255'],
+            'notes' => ['nullable', 'string'],
+            'reference_number' => ['nullable', 'string', 'max:100'],
+        ]);
 
-        if ($request->filled('from_date')) {
-            $query->whereDate('created_at', '>=', $request->from_date);
+        if ($validator->fails()) {
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
         }
 
-        if ($request->filled('to_date')) {
-            $query->whereDate('created_at', '<=', $request->to_date);
+        try {
+            $inventoryStock = DB::transaction(function () use ($request, $inventoryStock) {
+                $stock = InventoryStock::query()
+                    ->whereKey($inventoryStock->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $quantityBefore = (int) $stock->quantity;
+                $quantityAdded = (int) $request->quantity;
+                $quantityAfter = $quantityBefore + $quantityAdded;
+
+                $stock->update([
+                    'quantity' => $quantityAfter,
+                    'last_restocked_at' => now(),
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                StockMovement::create([
+                    'inventory_stock_id' => $stock->id,
+                    'food_item_id' => $stock->food_item_id,
+                    'movement_type' => StockMovement::TYPE_RESTOCK,
+                    'quantity_before' => $quantityBefore,
+                    'quantity_change' => $quantityAdded,
+                    'quantity_after' => $quantityAfter,
+                    'unit_cost' => $request->unit_cost,
+                    'total_cost' => $request->unit_cost !== null
+                        ? (float) $request->unit_cost * $quantityAdded
+                        : null,
+                    'reference_number' => $request->reference_number,
+                    'reason' => $request->reason ?? 'Stock added',
+                    'notes' => $request->notes,
+                    'movement_date' => now(),
+                    'created_by' => $request->user()->id,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                $stock->load('foodItem');
+                $this->syncLowStockAlert($stock, $request->user()->id);
+
+                return $stock;
+            });
+        } catch (\Throwable $e) {
+            return $this->sendError($e->getMessage(), [], 400);
         }
 
-        $totalAlerts = (clone $query)->count();
-        $activeAlerts = (clone $query)
-            ->where('status', LowStockAlert::STATUS_ACTIVE)
-            ->count();
-        $resolvedAlerts = (clone $query)
-            ->where('status', LowStockAlert::STATUS_RESOLVED)
-            ->count();
-        $dismissedAlerts = (clone $query)
-            ->where('status', LowStockAlert::STATUS_DISMISSED)
-            ->count();
-        $criticalAlerts = (clone $query)
-            ->where('status', LowStockAlert::STATUS_ACTIVE)
-            ->where('severity', LowStockAlert::SEVERITY_CRITICAL)
-            ->count();
+        $inventoryStock->load($this->defaultRelations());
 
-        $byStatus = (clone $query)
-            ->select('status', DB::raw('COUNT(*) as total_records'))
-            ->groupBy('status')
-            ->orderBy('status')
-            ->get();
-
-        $bySeverity = (clone $query)
-            ->select('severity', DB::raw('COUNT(*) as total_records'))
-            ->groupBy('severity')
-            ->orderBy('severity')
-            ->get();
-
-        $byType = (clone $query)
-            ->select('alert_type', DB::raw('COUNT(*) as total_records'))
-            ->groupBy('alert_type')
-            ->orderBy('alert_type')
-            ->get();
-
-        return $this->sendResponse([
-            'total_alerts' => $totalAlerts,
-            'active_alerts' => $activeAlerts,
-            'resolved_alerts' => $resolvedAlerts,
-            'dismissed_alerts' => $dismissedAlerts,
-            'critical_alerts' => $criticalAlerts,
-            'by_status' => $byStatus,
-            'by_severity' => $bySeverity,
-            'by_type' => $byType,
-        ], 'Low stock alert summary retrieved successfully.');
+        return $this->sendResponse(
+            $this->prepareStockResponse($inventoryStock),
+            'Stock added successfully.'
+        );
     }
 
+    /**
+     * Reduce sellable stock quantity without consuming reserved stock.
+     */
+    public function reduceStock(
+        Request $request,
+        InventoryStock $inventoryStock
+    ): JsonResponse {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can reduce stock.'
+            );
+        }
+
+        $validator = Validator::make($request->all(), [
+            'quantity' => ['required', 'integer', 'min:1'],
+            'movement_type' => [
+                'nullable',
+                'in:adjustment,damaged,expired,sale',
+            ],
+            'reason' => ['nullable', 'string', 'max:255'],
+            'notes' => ['nullable', 'string'],
+            'reference_number' => ['nullable', 'string', 'max:100'],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
+        }
+
+        try {
+            $inventoryStock = DB::transaction(function () use ($request, $inventoryStock) {
+                $stock = InventoryStock::query()
+                    ->whereKey($inventoryStock->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $availableQuantity = $this->availableQuantity($stock);
+                $requestedQuantity = (int) $request->quantity;
+
+                if ($requestedQuantity > $availableQuantity) {
+                    throw new \RuntimeException(
+                        'Not enough available stock. Available quantity: ' .
+                        $availableQuantity . '.'
+                    );
+                }
+
+                $quantityBefore = (int) $stock->quantity;
+                $quantityAfter = $quantityBefore - $requestedQuantity;
+
+                $stock->update([
+                    'quantity' => $quantityAfter,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                StockMovement::create([
+                    'inventory_stock_id' => $stock->id,
+                    'food_item_id' => $stock->food_item_id,
+                    'movement_type' => $request->movement_type
+                        ?? StockMovement::TYPE_ADJUSTMENT,
+                    'quantity_before' => $quantityBefore,
+                    'quantity_change' => -abs($requestedQuantity),
+                    'quantity_after' => $quantityAfter,
+                    'reference_number' => $request->reference_number,
+                    'reason' => $request->reason ?? 'Stock reduced',
+                    'notes' => $request->notes,
+                    'movement_date' => now(),
+                    'created_by' => $request->user()->id,
+                    'updated_by' => $request->user()->id,
+                ]);
+
+                $stock->load('foodItem');
+                $this->syncLowStockAlert($stock, $request->user()->id);
+
+                return $stock;
+            });
+        } catch (\Throwable $e) {
+            return $this->sendError($e->getMessage(), [], 400);
+        }
+
+        $inventoryStock->load($this->defaultRelations());
+
+        return $this->sendResponse(
+            $this->prepareStockResponse($inventoryStock),
+            'Stock reduced successfully.'
+        );
+    }
+
+    /**
+     * Display low-stock items using available stock.
+     */
+    public function lowStock(Request $request): JsonResponse
+    {
+        if (!$request->user()->canManageInventory()) {
+            return $this->sendForbidden(
+                'Only admin or staff can view low-stock items.'
+            );
+        }
+
+        $query = InventoryStock::query()
+            ->with($this->defaultRelations())
+            ->whereRaw(
+                '(quantity - COALESCE(reserved_quantity, 0)) <= low_stock_quantity'
+            )
+            ->orderByRaw(
+                '(quantity - COALESCE(reserved_quantity, 0)) ASC'
+            );
+
+        $perPage = min(max((int) $request->get('per_page', 20), 1), 200);
+        $stocks = $query->paginate($perPage);
+
+        $stocks->getCollection()->transform(
+            fn (InventoryStock $stock) => $this->prepareStockResponse($stock)
+        );
+
+        return $this->sendResponse(
+            $stocks,
+            'Low-stock items retrieved successfully.'
+        );
+    }
+
+    /**
+     * Default stock relations.
+     */
     private function defaultRelations(): array
     {
         return [
-            'inventoryStock:id,food_item_id,quantity,reserved_quantity,low_stock_quantity,location,status,last_restocked_at',
-            'foodItem:id,food_category_id,name,sku,price,unit,status,is_available',
-            'foodItem.category:id,name',
-            'resolvedBy:id,name,email,phone,role',
-            'dismissedBy:id,name,email,phone,role',
+            'foodItem:id,food_category_id,name,slug,sku,price,cost_price,unit,status,is_available,low_stock_quantity',
+            'foodItem.category:id,name,slug,status',
             'createdBy:id,name,email,phone,role',
             'updatedBy:id,name,email,phone,role',
         ];
     }
 
+    /**
+     * Add computed available and low-stock fields.
+     */
+    private function prepareStockResponse(
+        InventoryStock $stock
+    ): InventoryStock {
+        $available = $this->availableQuantity($stock);
+        $threshold = $this->thresholdQuantity($stock);
+
+        $stock->setAttribute('available_quantity', $available);
+        $stock->setAttribute('is_low_stock', $available <= $threshold);
+        $stock->setAttribute('is_out_of_stock', $available <= 0);
+
+        return $stock;
+    }
+
+    /**
+     * Calculate stock available for sale.
+     */
     private function availableQuantity(InventoryStock $stock): int
     {
         return max(
@@ -615,16 +608,10 @@ class LowStockAlertController extends BaseController
         );
     }
 
-    private function generateAlertNumber(): string
-    {
-        do {
-            $number = 'LSA-' . now()->format('Ymd') . '-' . strtoupper(Str::random(8));
-        } while (LowStockAlert::where('alert_number', $number)->exists());
-
-        return $number;
-    }
-
-    private function getThresholdQuantity(InventoryStock $stock): int
+    /**
+     * Resolve the low-stock threshold.
+     */
+    private function thresholdQuantity(InventoryStock $stock): int
     {
         if (
             $stock->low_stock_quantity !== null &&
@@ -643,11 +630,79 @@ class LowStockAlertController extends BaseController
         return 5;
     }
 
-    private function determineAlertType(int $available): string
-    {
-        return $available <= 0
-            ? LowStockAlert::TYPE_OUT_OF_STOCK
-            : LowStockAlert::TYPE_LOW_STOCK;
+    /**
+     * Create, refresh, or resolve the active low-stock alert.
+     */
+    private function syncLowStockAlert(
+        InventoryStock $stock,
+        int $userId
+    ): void {
+        if (!$stock->relationLoaded('foodItem')) {
+            $stock->load('foodItem');
+        }
+
+        $available = $this->availableQuantity($stock);
+        $threshold = $this->thresholdQuantity($stock);
+
+        $activeAlert = LowStockAlert::query()
+            ->where('inventory_stock_id', $stock->id)
+            ->where('status', LowStockAlert::STATUS_ACTIVE)
+            ->lockForUpdate()
+            ->first();
+
+        if (
+            $stock->status === InventoryStock::STATUS_ACTIVE &&
+            $available <= $threshold
+        ) {
+            $alertType = $available <= 0
+                ? LowStockAlert::TYPE_OUT_OF_STOCK
+                : LowStockAlert::TYPE_LOW_STOCK;
+
+            $severity = $this->determineSeverity($available, $threshold);
+            $message = $this->buildAlertMessage(
+                $stock,
+                $available,
+                $threshold
+            );
+
+            if ($activeAlert) {
+                $activeAlert->update([
+                    'alert_type' => $alertType,
+                    'severity' => $severity,
+                    'current_quantity' => $available,
+                    'threshold_quantity' => $threshold,
+                    'message' => $message,
+                    'updated_by' => $userId,
+                ]);
+            } else {
+                LowStockAlert::create([
+                    'inventory_stock_id' => $stock->id,
+                    'food_item_id' => $stock->food_item_id,
+                    'alert_number' => $this->generateAlertNumber(),
+                    'alert_type' => $alertType,
+                    'severity' => $severity,
+                    'current_quantity' => $available,
+                    'threshold_quantity' => $threshold,
+                    'status' => LowStockAlert::STATUS_ACTIVE,
+                    'message' => $message,
+                    'notes' => 'Generated automatically after a stock change.',
+                    'created_by' => $userId,
+                    'updated_by' => $userId,
+                ]);
+            }
+
+            return;
+        }
+
+        if ($activeAlert) {
+            $activeAlert->update([
+                'status' => LowStockAlert::STATUS_RESOLVED,
+                'resolved_by' => $userId,
+                'resolved_at' => now(),
+                'resolution_notes' => 'Auto-resolved because available stock is now above the threshold or the stock record is inactive.',
+                'updated_by' => $userId,
+            ]);
+        }
     }
 
     private function determineSeverity(int $available, int $threshold): string
@@ -669,17 +724,25 @@ class LowStockAlertController extends BaseController
 
     private function buildAlertMessage(
         InventoryStock $stock,
-        string $alertType,
         int $available,
         int $threshold
     ): string {
         $foodName = $stock->foodItem?->name ?? 'Food item';
 
-        if ($alertType === LowStockAlert::TYPE_OUT_OF_STOCK) {
+        if ($available <= 0) {
             return $foodName . ' is out of stock. Available quantity is 0.';
         }
 
         return $foodName . ' is low in stock. Available quantity is ' .
             $available . ', threshold is ' . $threshold . '.';
+    }
+
+    private function generateAlertNumber(): string
+    {
+        do {
+            $number = 'LSA-' . now()->format('Ymd') . '-' . strtoupper(Str::random(8));
+        } while (LowStockAlert::where('alert_number', $number)->exists());
+
+        return $number;
     }
 }
