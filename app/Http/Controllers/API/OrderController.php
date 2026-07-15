@@ -41,15 +41,61 @@ class OrderController extends BaseController
             $query->where('user_id', $request->user_id);
         }
 
-        foreach ([
+        /*
+         * Support both backend `order_status` and frontend `status`.
+         *
+         * The dashboard displays the initial order stage as "Pending",
+         * while newer wallet-paid orders are stored as "confirmed".
+         * Therefore, requesting pending orders returns both legacy
+         * `pending` and current `confirmed` records.
+         */
+        $requestedOrderStatus = $request->input(
             'order_status',
+            $request->input('status')
+        );
+
+        if (
+            $requestedOrderStatus !== null &&
+            trim((string) $requestedOrderStatus) !== ''
+        ) {
+            $normalizedStatus = strtolower(
+                trim((string) $requestedOrderStatus)
+            );
+
+            if ($normalizedStatus === 'pending') {
+                $query->whereIn(
+                    'order_status',
+                    $this->initialOrderStatuses()
+                );
+            } else {
+                $query->where(
+                    'order_status',
+                    $normalizedStatus
+                );
+            }
+        }
+
+        foreach ([
             'payment_status',
             'pickup_status',
             'order_type',
         ] as $field) {
             if ($request->filled($field)) {
-                $query->where($field, $request->input($field));
+                $query->where(
+                    $field,
+                    $request->input($field)
+                );
             }
+        }
+
+        if (
+            $authUser->canManageOrders() &&
+            (
+                $request->boolean('with_trashed') ||
+                $request->boolean('include_deleted')
+            )
+        ) {
+            $query->withTrashed();
         }
 
         if ($request->filled('from_date')) {
@@ -481,7 +527,10 @@ class OrderController extends BaseController
     }
 
     /**
-     * Move CONFIRMED -> PREPARING.
+     * Move PENDING/CONFIRMED -> PREPARING.
+     *
+     * Older orders may use `pending`, while current wallet-paid orders
+     * are created as `confirmed`. Both represent the initial kitchen queue.
      */
     public function markPreparing(
         Request $request,
@@ -493,17 +542,111 @@ class OrderController extends BaseController
             );
         }
 
-        if ($order->order_status !== Order::STATUS_CONFIRMED) {
+        $validator = Validator::make($request->all(), [
+            'notes' => ['nullable', 'string'],
+        ]);
+
+        if ($validator->fails()) {
+            return $this->sendValidationError(
+                $validator->errors(),
+                'Please check your input.'
+            );
+        }
+
+        try {
+            $order = DB::transaction(function () use (
+                $request,
+                $order
+            ) {
+                $lockedOrder = Order::query()
+                    ->whereKey($order->id)
+                    ->lockForUpdate()
+                    ->firstOrFail();
+
+                $currentStatus = strtolower(
+                    trim((string) $lockedOrder->order_status)
+                );
+
+                if (
+                    !in_array(
+                        $currentStatus,
+                        $this->initialOrderStatuses(),
+                        true
+                    )
+                ) {
+                    throw new \RuntimeException(
+                        'Only pending or confirmed orders can be marked as preparing. Current status: ' .
+                        ($lockedOrder->order_status ?: 'unknown') .
+                        '.'
+                    );
+                }
+
+                if (
+                    $lockedOrder->payment_status !==
+                    Order::PAYMENT_PAID
+                ) {
+                    throw new \RuntimeException(
+                        'Only paid orders can be marked as preparing.'
+                    );
+                }
+
+                $updateData = [
+                    'order_status' => Order::STATUS_PREPARING,
+                ];
+
+                /*
+                 * Legacy pending orders may not have confirmation metadata.
+                 */
+                if (!$lockedOrder->confirmed_by) {
+                    $updateData['confirmed_by'] =
+                        $request->user()->id;
+                }
+
+                if (!$lockedOrder->confirmed_at) {
+                    $updateData['confirmed_at'] = now();
+                }
+
+                if ($request->filled('notes')) {
+                    $existingNotes = trim(
+                        (string) $lockedOrder->staff_notes
+                    );
+
+                    $newNote = trim(
+                        (string) $request->notes
+                    );
+
+                    $updateData['staff_notes'] =
+                        $existingNotes !== ''
+                            ? $existingNotes . PHP_EOL . $newNote
+                            : $newNote;
+                }
+
+                $lockedOrder->update($updateData);
+
+                /*
+                 * Keep item statuses coherent with the parent order.
+                 */
+                $lockedOrder->orderItems()
+                    ->whereIn('item_status', [
+                        'pending',
+                        OrderItem::STATUS_CONFIRMED,
+                    ])
+                    ->update([
+                        'item_status' =>
+                            OrderItem::STATUS_CONFIRMED,
+                        'updated_by' =>
+                            $request->user()->id,
+                    ]);
+
+                return $lockedOrder;
+            });
+        } catch (\Throwable $e) {
             return $this->sendError(
-                'Only confirmed orders can be marked as preparing.',
+                $e->getMessage(),
                 [],
                 400
             );
         }
-
-        $order->update([
-            'order_status' => Order::STATUS_PREPARING,
-        ]);
 
         $order->load($this->defaultRelations());
 
@@ -989,23 +1132,94 @@ class OrderController extends BaseController
             $query->whereDate('ordered_at', '<=', $request->to_date);
         }
 
+        if (
+            $authUser->canManageOrders() &&
+            (
+                $request->boolean('with_trashed') ||
+                $request->boolean('include_deleted')
+            )
+        ) {
+            $query->withTrashed();
+        }
+
         $totalOrders = (clone $query)->count();
-        $paidOrders = (clone $query)
-            ->where('payment_status', Order::PAYMENT_PAID)
+
+        /*
+         * The dashboard calls the initial queue "Pending".
+         * Count both legacy `pending` and current `confirmed` records.
+         */
+        $pendingOrders = (clone $query)
+            ->whereIn(
+                'order_status',
+                $this->initialOrderStatuses()
+            )
             ->count();
+
+        $confirmedOrders = (clone $query)
+            ->where(
+                'order_status',
+                Order::STATUS_CONFIRMED
+            )
+            ->count();
+
+        $preparingOrders = (clone $query)
+            ->where(
+                'order_status',
+                Order::STATUS_PREPARING
+            )
+            ->count();
+
+        $readyOrders = (clone $query)
+            ->where(
+                'order_status',
+                Order::STATUS_READY
+            )
+            ->count();
+
         $completedOrders = (clone $query)
-            ->where('order_status', Order::STATUS_COMPLETED)
+            ->where(
+                'order_status',
+                Order::STATUS_COMPLETED
+            )
             ->count();
+
         $cancelledOrders = (clone $query)
-            ->where('order_status', Order::STATUS_CANCELLED)
+            ->where(
+                'order_status',
+                Order::STATUS_CANCELLED
+            )
+            ->count();
+
+        $paidOrders = (clone $query)
+            ->where(
+                'payment_status',
+                Order::PAYMENT_PAID
+            )
             ->count();
 
         $totalSales = (float) (clone $query)
-            ->where('payment_status', Order::PAYMENT_PAID)
+            ->where(
+                'payment_status',
+                Order::PAYMENT_PAID
+            )
+            ->sum('paid_amount');
+
+        $completedSales = (float) (clone $query)
+            ->where(
+                'order_status',
+                Order::STATUS_COMPLETED
+            )
+            ->where(
+                'payment_status',
+                Order::PAYMENT_PAID
+            )
             ->sum('paid_amount');
 
         $refundedAmount = (float) (clone $query)
-            ->where('payment_status', Order::PAYMENT_REFUNDED)
+            ->where(
+                'payment_status',
+                Order::PAYMENT_REFUNDED
+            )
             ->sum('paid_amount');
 
         $byStatus = (clone $query)
@@ -1030,14 +1244,43 @@ class OrderController extends BaseController
 
         return $this->sendResponse([
             'total_orders' => $totalOrders,
-            'paid_orders' => $paidOrders,
+
+            /*
+             * Keys used directly by the Next.js order dashboard.
+             */
+            'pending_orders' => $pendingOrders,
+            'preparing_orders' => $preparingOrders,
+            'ready_orders' => $readyOrders,
             'completed_orders' => $completedOrders,
             'cancelled_orders' => $cancelledOrders,
             'total_sales' => $totalSales,
+            'completed_sales' => $completedSales,
             'refunded_amount' => $refundedAmount,
+
+            /*
+             * Retained for existing clients and detailed reports.
+             */
+            'confirmed_orders' => $confirmedOrders,
+            'paid_orders' => $paidOrders,
             'by_status' => $byStatus,
             'by_payment_status' => $byPaymentStatus,
         ], 'Order summary retrieved successfully.');
+    }
+
+    /**
+     * Initial order statuses accepted before kitchen preparation.
+     *
+     * `pending` is retained for orders created before the controller update.
+     * New wallet-paid orders use Order::STATUS_CONFIRMED.
+     */
+    private function initialOrderStatuses(): array
+    {
+        return array_values(array_unique([
+            'pending',
+            strtolower(
+                trim((string) Order::STATUS_CONFIRMED)
+            ),
+        ]));
     }
 
     private function defaultRelations(): array
