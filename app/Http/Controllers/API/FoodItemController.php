@@ -213,7 +213,10 @@ class FoodItemController extends BaseController
     ): JsonResponse {
         $foodItem->load($this->defaultRelations());
 
-        if (!$request->user()->canManageInventory()) {
+        $authUser = $request->user();
+        $canManage = $authUser?->canManageInventory() ?? false;
+
+        if (!$canManage) {
             $availableQuantity = $this->availableQuantity($foodItem);
 
             if (

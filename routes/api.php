@@ -94,6 +94,51 @@ Route::post(
     ->whereNumber('tableActionEvent')
     ->middleware('throttle:240,1');
 
+
+/*
+|--------------------------------------------------------------------------
+| Public Food Menu Routes
+|--------------------------------------------------------------------------
+|
+| These routes are used by the public restaurant home page.
+| Authentication is not required.
+|
+| Only active categories and active food items with available stock
+| are returned by the controllers.
+|
+*/
+
+Route::get(
+    'food-categories/public',
+    [FoodCategoryController::class, 'index']
+)
+    ->middleware('throttle:120,1')
+    ->name('public.food-categories.index');
+
+Route::get(
+    'food-categories/public/{foodCategory}',
+    [FoodCategoryController::class, 'show']
+)
+    ->whereNumber('foodCategory')
+    ->middleware('throttle:120,1')
+    ->name('public.food-categories.show');
+
+Route::get(
+    'food-items/public',
+    [FoodItemController::class, 'index']
+)
+    ->middleware('throttle:120,1')
+    ->name('public.food-items.index');
+
+Route::get(
+    'food-items/public/{foodItem}',
+    [FoodItemController::class, 'show']
+)
+    ->whereNumber('foodItem')
+    ->middleware('throttle:120,1')
+    ->name('public.food-items.show');
+
+
 /*
 |--------------------------------------------------------------------------
 | Protected API Routes
