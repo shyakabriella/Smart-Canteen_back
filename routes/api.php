@@ -10,6 +10,7 @@ use App\Http\Controllers\API\StockMovementController;
 use App\Http\Controllers\API\WalletTopUpController;
 use App\Http\Controllers\API\WalletTransactionController;
 use App\Http\Controllers\API\OrderController;
+use App\Http\Controllers\API\GuestOrderController;
 use App\Http\Controllers\API\OrderItemController;
 use App\Http\Controllers\API\OrderQrCodeController;
 use App\Http\Controllers\API\QrScanLogController;
@@ -137,6 +138,30 @@ Route::get(
     ->whereNumber('foodItem')
     ->middleware('throttle:120,1')
     ->name('public.food-items.show');
+
+
+
+/*
+|--------------------------------------------------------------------------
+| Public Guest Delivery Orders
+|--------------------------------------------------------------------------
+|
+| Website visitors do not need an account.
+| These routes do not use or modify wallet balances.
+|
+*/
+
+Route::post(
+    'guest-orders',
+    [GuestOrderController::class, 'store']
+)->middleware('throttle:20,1');
+
+Route::get(
+    'guest-orders/track/{publicToken}',
+    [GuestOrderController::class, 'track']
+)
+    ->where('publicToken', '[A-Za-z0-9]{64}')
+    ->middleware('throttle:60,1');
 
 
 /*
@@ -388,6 +413,49 @@ Route::middleware('auth:sanctum')->group(function () {
         'wallet-transactions/{id}/restore',
         [WalletTransactionController::class, 'restore']
     )->whereNumber('id');
+
+
+    /*
+    |--------------------------------------------------------------------------
+    | Guest Delivery Order Management
+    |--------------------------------------------------------------------------
+    */
+
+    Route::get(
+        'guest-orders',
+        [GuestOrderController::class, 'index']
+    );
+
+    Route::get(
+        'guest-orders/{guestOrder}',
+        [GuestOrderController::class, 'show']
+    )->whereNumber('guestOrder');
+
+    Route::post(
+        'guest-orders/{guestOrder}/confirm',
+        [GuestOrderController::class, 'confirm']
+    )->whereNumber('guestOrder');
+
+    Route::post(
+        'guest-orders/{guestOrder}/preparing',
+        [GuestOrderController::class, 'markPreparing']
+    )->whereNumber('guestOrder');
+
+    Route::post(
+        'guest-orders/{guestOrder}/ready',
+        [GuestOrderController::class, 'markReady']
+    )->whereNumber('guestOrder');
+
+    Route::post(
+        'guest-orders/{guestOrder}/complete-delivery',
+        [GuestOrderController::class, 'completeDelivery']
+    )->whereNumber('guestOrder');
+
+    Route::post(
+        'guest-orders/{guestOrder}/cancel',
+        [GuestOrderController::class, 'cancel']
+    )->whereNumber('guestOrder');
+
 
     /*
     |--------------------------------------------------------------------------
